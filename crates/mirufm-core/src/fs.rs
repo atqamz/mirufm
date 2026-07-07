@@ -122,11 +122,8 @@ mod tests {
     fn detects_symlink_without_following() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("target.txt"), b"x").unwrap();
-        std::os::unix::fs::symlink(
-            dir.path().join("target.txt"),
-            dir.path().join("link.txt"),
-        )
-        .unwrap();
+        std::os::unix::fs::symlink(dir.path().join("target.txt"), dir.path().join("link.txt"))
+            .unwrap();
 
         let entries = read_dir(dir.path(), &no_cancel()).unwrap();
         let link = entries.iter().find(|e| e.name == "link.txt").unwrap();
