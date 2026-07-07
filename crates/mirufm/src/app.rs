@@ -36,9 +36,11 @@ impl Mirufm {
 
     fn descend(&mut self, col: usize, entry_index: usize, cx: &mut Context<Self>) {
         let to_load = self.state.descend(col, entry_index);
-        // state.descend() always truncates columns to col + 1; drop the
-        // watchers for the columns it just discarded to match.
-        self.watchers.truncate(col + 1);
+        // state.descend() may leave columns untouched (stale click index),
+        // truncate to col + 1, or truncate then push a new column; derive
+        // the watcher length from the actual result instead of assuming.
+        self.watchers
+            .truncate(self.state.columns.len() - usize::from(to_load.is_some()));
         if let Some(path) = to_load {
             self.watchers.push(None); // matches the Loading column just pushed
             self.load(path, cx);

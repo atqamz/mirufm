@@ -28,9 +28,9 @@ pub fn watch(path: &Path, on_change: impl Fn() + Send + 'static) -> Result<Watch
     inner.watch(path, RecursiveMode::NonRecursive)?;
 
     thread::spawn(move || {
-        while rx.recv().is_ok() {
+        while let Ok(Ok(_event)) = rx.recv() {
             // Coalesce a burst of events into a single callback.
-            while rx.recv_timeout(DEBOUNCE).is_ok() {}
+            while matches!(rx.recv_timeout(DEBOUNCE), Ok(Ok(_))) {}
             on_change();
         }
     });
@@ -41,7 +41,6 @@ pub fn watch(path: &Path, on_change: impl Fn() + Send + 'static) -> Result<Watch
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc::channel;
 
     #[test]
     fn fires_on_file_creation() {
