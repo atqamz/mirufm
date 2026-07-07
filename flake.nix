@@ -21,6 +21,7 @@
           xorg.libX11
           xorg.libXcursor
           xorg.libXi
+          xorg.libxcb
           fontconfig
           freetype
         ];

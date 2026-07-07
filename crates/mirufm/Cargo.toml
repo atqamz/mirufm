@@ -7,3 +7,5 @@ repository.workspace = true
 
 [dependencies]
 mirufm-core = { path = "../mirufm-core" }
+gpui.workspace = true
+gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
