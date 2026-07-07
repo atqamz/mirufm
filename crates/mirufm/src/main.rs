@@ -1,30 +1,21 @@
-use gpui::{div, prelude::*, rgb, App, Context, Render, Window, WindowOptions};
+mod app;
 
-struct Mirufm;
-
-impl Render for Mirufm {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .bg(rgb(0x1e1e1e))
-            .size_full()
-            .justify_center()
-            .items_center()
-            .text_color(rgb(0xffffff))
-            .child("mirufm")
-    }
-}
+use app::Mirufm;
+use gpui::{prelude::*, App, WindowOptions};
 
 fn main() {
-    gpui_platform::application().run(|cx: &mut App| {
+    let root = std::env::current_dir().unwrap_or_else(|_| "/".into());
+    gpui_platform::application().run(move |cx: &mut App| {
         cx.on_window_closed(|cx, _window_id| {
             if cx.windows().is_empty() {
                 cx.quit();
             }
         })
         .detach();
-        cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| Mirufm))
-            .unwrap();
+        cx.open_window(WindowOptions::default(), |_, cx| {
+            cx.new(|cx| Mirufm::new(root, cx))
+        })
+        .unwrap();
         cx.activate(true);
     });
 }
