@@ -1,6 +1,6 @@
+use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::collections::BinaryHeap;
 use std::sync::{Condvar, Mutex};
 use std::thread;
 

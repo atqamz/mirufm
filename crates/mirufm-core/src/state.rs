@@ -71,7 +71,10 @@ impl AppState {
     pub fn set_loaded(&mut self, path: &Path, entries: Vec<Entry>, now: SystemTime) {
         self.cache.insert(
             path.to_path_buf(),
-            CachedFolder { entries: entries.clone(), loaded_at: now },
+            CachedFolder {
+                entries: entries.clone(),
+                loaded_at: now,
+            },
         );
         if let Some(c) = self.columns.iter_mut().find(|c| c.path == path) {
             c.entries = entries;
@@ -90,7 +93,11 @@ mod tests {
             name: name.to_string(),
             path: parent.join(name),
             kind: EntryKind::Dir,
-            meta: Meta { size: 0, modified: None, readonly: false },
+            meta: Meta {
+                size: 0,
+                modified: None,
+                readonly: false,
+            },
         }
     }
     fn file_entry(name: &str, parent: &Path) -> Entry {
@@ -98,7 +105,11 @@ mod tests {
             name: name.to_string(),
             path: parent.join(name),
             kind: EntryKind::File,
-            meta: Meta { size: 0, modified: None, readonly: false },
+            meta: Meta {
+                size: 0,
+                modified: None,
+                readonly: false,
+            },
         }
     }
 
@@ -114,7 +125,11 @@ mod tests {
     fn descend_into_dir_pushes_loading_column() {
         let mut s = AppState::new(PathBuf::from("/root"));
         let sub = dir_entry("sub", Path::new("/root"));
-        s.set_loaded(Path::new("/root"), vec![sub.clone()], SystemTime::UNIX_EPOCH);
+        s.set_loaded(
+            Path::new("/root"),
+            vec![sub.clone()],
+            SystemTime::UNIX_EPOCH,
+        );
 
         let to_load = s.descend(0, 0);
         assert_eq!(to_load, Some(PathBuf::from("/root/sub")));
