@@ -28,9 +28,13 @@ pub fn watch(path: &Path, on_change: impl Fn() + Send + 'static) -> Result<Watch
     inner.watch(path, RecursiveMode::NonRecursive)?;
 
     thread::spawn(move || {
-        while let Ok(Ok(_event)) = rx.recv() {
-            // Coalesce a burst of events into a single callback.
-            while matches!(rx.recv_timeout(DEBOUNCE), Ok(Ok(_))) {}
+        // Ok(Err(_)) is a notify-internal error (e.g. inotify queue overflow on a
+        // busy directory), not a watcher shutdown - treat it as "something may have
+        // changed" and keep going. Only a channel disconnect (the watcher dropped)
+        // ends the thread.
+        while rx.recv().is_ok() {
+            // Coalesce a burst of events (and any interleaved errors) into a single callback.
+            while rx.recv_timeout(DEBOUNCE).is_ok() {}
             on_change();
         }
     });

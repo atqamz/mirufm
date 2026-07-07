@@ -143,6 +143,6 @@ mod tests {
         handle.cancel();
         block_tx.send(()).unwrap(); // release the worker
 
-        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), true);
+        assert!(rx.recv_timeout(Duration::from_secs(5)).unwrap());
     }
 }

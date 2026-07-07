@@ -4,10 +4,11 @@ use std::time::SystemTime;
 
 use crate::fs::{Entry, EntryKind};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stage {
     Loading,
     Loaded,
+    Error(String),
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +80,13 @@ impl AppState {
         if let Some(c) = self.columns.iter_mut().find(|c| c.path == path) {
             c.entries = entries;
             c.stage = Stage::Loaded;
+        }
+    }
+
+    pub fn set_error(&mut self, path: &Path, message: String) {
+        if let Some(c) = self.columns.iter_mut().find(|c| c.path == path) {
+            c.entries.clear();
+            c.stage = Stage::Error(message);
         }
     }
 }
@@ -173,5 +181,20 @@ mod tests {
         assert_eq!(s.columns[0].stage, Stage::Loaded);
         assert_eq!(s.columns[0].entries.len(), 1);
         assert!(s.cache.contains_key(Path::new("/root")));
+    }
+
+    #[test]
+    fn set_error_marks_column_and_clears_entries() {
+        let mut s = AppState::new(PathBuf::from("/root"));
+        let e = file_entry("x", Path::new("/root"));
+        s.set_loaded(Path::new("/root"), vec![e], SystemTime::UNIX_EPOCH);
+
+        s.set_error(Path::new("/root"), "permission denied".to_string());
+
+        assert_eq!(
+            s.columns[0].stage,
+            Stage::Error("permission denied".to_string())
+        );
+        assert!(s.columns[0].entries.is_empty());
     }
 }
