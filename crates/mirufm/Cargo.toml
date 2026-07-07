@@ -1,0 +1,9 @@
+[package]
+name = "mirufm"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mirufm-core = { path = "../mirufm-core" }
