@@ -1,5 +1,5 @@
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
 use std::time::SystemTime;
@@ -11,11 +11,14 @@ use mirufm_core::fs::{read_dir, EntryKind};
 use mirufm_core::scheduler::{Priority, Scheduler};
 use mirufm_core::sort::{sort, SortKey};
 use mirufm_core::state::AppState;
+use mirufm_core::watch;
 
 pub struct Mirufm {
     state: AppState,
     scheduler: Arc<Scheduler>,
     strip_scroll: ScrollHandle,
+    // Parallel to `state.columns`: watches the loaded directory at each depth.
+    watchers: Vec<Option<watch::Watcher>>,
 }
 
 impl Mirufm {
@@ -25,13 +28,19 @@ impl Mirufm {
             state: AppState::new(root.clone()),
             scheduler,
             strip_scroll: ScrollHandle::new(),
+            watchers: vec![None],
         };
         me.load(root, cx);
         me
     }
 
     fn descend(&mut self, col: usize, entry_index: usize, cx: &mut Context<Self>) {
-        if let Some(path) = self.state.descend(col, entry_index) {
+        let to_load = self.state.descend(col, entry_index);
+        // state.descend() always truncates columns to col + 1; drop the
+        // watchers for the columns it just discarded to match.
+        self.watchers.truncate(col + 1);
+        if let Some(path) = to_load {
+            self.watchers.push(None); // matches the Loading column just pushed
             self.load(path, cx);
             self.strip_scroll.scroll_to_item(col + 1);
         }
@@ -39,6 +48,15 @@ impl Mirufm {
     }
 
     fn load(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        // Reused entries make back-navigation instant; still refreshed below
+        // in case the directory changed since it was cached.
+        if let Some(cached) = self.state.cache.get(&path).cloned() {
+            self.state
+                .set_loaded(&path, cached.entries, cached.loaded_at);
+            self.watch_column(&path, cx);
+            cx.notify();
+        }
+
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let p = path.clone();
@@ -56,9 +74,54 @@ impl Mirufm {
             };
             this.update(cx, |this, cx| {
                 this.state.set_loaded(&path, entries, SystemTime::now());
+                this.watch_column(&path, cx);
                 cx.notify();
             })
             .ok();
+        })
+        .detach();
+    }
+
+    /// Starts watching `path` if its column isn't already watched, and hands
+    /// each change notification back to the foreground the same way `load`
+    /// hands off its background read: an mpsc channel drained by a
+    /// `cx.background_spawn` future inside a `cx.spawn` loop.
+    fn watch_column(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let Some(idx) = self.state.columns.iter().position(|c| c.path == path) else {
+            return;
+        };
+        if matches!(self.watchers.get(idx), Some(Some(_))) {
+            return; // already watching this column
+        }
+
+        let (tx, rx) = mpsc::channel::<()>();
+        let watcher = match watch::watch(path, move || {
+            let _ = tx.send(());
+        }) {
+            Ok(w) => w,
+            Err(_) => return,
+        };
+        self.watchers[idx] = Some(watcher);
+
+        let watched = path.to_path_buf();
+        cx.spawn(async move |this, cx| {
+            let mut rx = rx;
+            loop {
+                let (returned_rx, changed) = cx
+                    .background_spawn(async move {
+                        let changed = rx.recv().is_ok();
+                        (rx, changed)
+                    })
+                    .await;
+                rx = returned_rx;
+                if !changed {
+                    return; // watcher dropped (column truncated or replaced)
+                }
+                let reload = watched.clone();
+                if this.update(cx, |this, cx| this.load(reload, cx)).is_err() {
+                    return; // view gone
+                }
+            }
         })
         .detach();
     }
