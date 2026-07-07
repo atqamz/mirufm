@@ -3308,6 +3308,8 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "mirufm-core",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

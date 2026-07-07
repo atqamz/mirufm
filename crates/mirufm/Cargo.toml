@@ -9,3 +9,5 @@ repository.workspace = true
 mirufm-core = { path = "../mirufm-core" }
 gpui.workspace = true
 gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
