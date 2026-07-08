@@ -217,6 +217,7 @@ impl Mirufm {
         }
         menu.apps = Some(Vec::new()); // marks loading; replaced when the scan returns
         let path = menu.target.path.clone();
+        let for_path = path.clone();
 
         let (tx, rx) = mpsc::channel::<Vec<DesktopApp>>();
         self.scheduler.spawn(Priority::Preview, move |_cancel| {
@@ -227,9 +228,13 @@ impl Mirufm {
                 return;
             };
             this.update(cx, |this, cx| {
+                // Only apply if the menu that requested this scan is still open;
+                // a scan for a superseded menu must not clobber the current one.
                 if let Some(menu) = &mut this.menu {
-                    menu.apps = Some(apps);
-                    cx.notify();
+                    if menu.target.path == for_path {
+                        menu.apps = Some(apps);
+                        cx.notify();
+                    }
                 }
             })
             .ok();
