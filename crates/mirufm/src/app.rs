@@ -9,10 +9,12 @@ use std::thread;
 use std::time::SystemTime;
 
 use gpui::{
-    div, prelude::*, px, rgb, uniform_list, AnyElement, Context, IntoElement, Render, ScrollHandle,
+    anchored, deferred, div, prelude::*, px, rgb, uniform_list, AnyElement, ClickEvent, Context,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, Render, ScrollHandle,
     Window,
 };
 use mirufm_core::fs::{read_dir, Entry, EntryKind};
+use mirufm_core::launch::DesktopApp;
 use mirufm_core::preview::{preview, MetaView, PreviewModel};
 use mirufm_core::scheduler::{Priority, Scheduler};
 use mirufm_core::sort::{sort, SortKey};
@@ -66,6 +68,15 @@ where
     BlockingFuture(shared)
 }
 
+// Right-click context menu; closed when `Mirufm::menu` is `None`.
+struct ContextMenu {
+    target: Entry,
+    dir: PathBuf,
+    pos: Point<Pixels>,
+    // None = not yet loaded; Some = loaded app list (possibly empty).
+    apps: Option<Vec<DesktopApp>>,
+}
+
 pub struct Mirufm {
     state: AppState,
     scheduler: Arc<Scheduler>,
@@ -75,6 +86,9 @@ pub struct Mirufm {
     preview: Option<PreviewModel>,
     // Flipped true to abort a superseded preview read (same own-Arc pattern as `load`).
     preview_cancel: Option<Arc<AtomicBool>>,
+    menu: Option<ContextMenu>,
+    // Transient status line shown in the header (spawn failures, "no terminal").
+    notice: Option<String>,
 }
 
 impl Mirufm {
@@ -87,6 +101,8 @@ impl Mirufm {
             watchers: vec![None],
             preview: None,
             preview_cancel: None,
+            menu: None,
+            notice: None,
         };
         me.load(root, cx);
         me
@@ -120,6 +136,105 @@ impl Mirufm {
         }
         debug_assert_eq!(self.watchers.len(), self.state.columns.len());
         cx.notify();
+    }
+
+    fn open_menu(
+        &mut self,
+        col: usize,
+        entry_index: usize,
+        pos: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(entry) = self
+            .state
+            .columns
+            .get(col)
+            .and_then(|c| c.entries.get(entry_index))
+            .cloned()
+        else {
+            return;
+        };
+        let dir = if entry.kind == EntryKind::Dir {
+            entry.path.clone()
+        } else {
+            entry
+                .path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| entry.path.clone())
+        };
+        self.notice = None;
+        self.menu = Some(ContextMenu {
+            target: entry,
+            dir,
+            pos,
+            apps: None,
+        });
+        cx.notify();
+    }
+
+    fn close_menu(&mut self, cx: &mut Context<Self>) {
+        self.menu = None;
+        cx.notify();
+    }
+
+    fn menu_open_default(&mut self, cx: &mut Context<Self>) {
+        if let Some(menu) = &self.menu {
+            if let Err(e) = crate::actions::open_default(&menu.target.path) {
+                self.notice = Some(format!("open failed: {e}"));
+            }
+        }
+        self.close_menu(cx);
+    }
+
+    fn menu_open_terminal(&mut self, cx: &mut Context<Self>) {
+        if let Some(menu) = &self.menu {
+            match crate::actions::open_terminal(&menu.dir) {
+                Ok(true) => {}
+                Ok(false) => self.notice = Some("set $TERMINAL or install a terminal".to_string()),
+                Err(e) => self.notice = Some(format!("terminal failed: {e}")),
+            }
+        }
+        self.close_menu(cx);
+    }
+
+    fn menu_open_with(&mut self, app: DesktopApp, cx: &mut Context<Self>) {
+        if let Some(menu) = &self.menu {
+            if let Err(e) = crate::actions::open_with(&app, &menu.target.path) {
+                self.notice = Some(format!("open with {} failed: {e}", app.name));
+            }
+        }
+        self.close_menu(cx);
+    }
+
+    /// Lazily load the app list for the Open With submenu (disk scan off-thread).
+    fn load_menu_apps(&mut self, cx: &mut Context<Self>) {
+        let Some(menu) = &mut self.menu else {
+            return;
+        };
+        if menu.apps.is_some() {
+            return; // already loaded / loading
+        }
+        menu.apps = Some(Vec::new()); // marks loading; replaced when the scan returns
+        let path = menu.target.path.clone();
+
+        let (tx, rx) = mpsc::channel::<Vec<DesktopApp>>();
+        self.scheduler.spawn(Priority::Preview, move |_cancel| {
+            let _ = tx.send(crate::actions::apps_for_path(&path));
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(apps) = spawn_blocking(move || rx.recv()).await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                if let Some(menu) = &mut this.menu {
+                    menu.apps = Some(apps);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn preview_entry(&mut self, entry: Entry, cx: &mut Context<Self>) {
@@ -285,6 +400,78 @@ impl Mirufm {
             .overflow_y_scroll()
             .child(body)
     }
+
+    fn render_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let menu = self.menu.as_ref()?;
+        let is_file = menu.target.kind != EntryKind::Dir;
+
+        let item = |label: String| {
+            div()
+                .px_3()
+                .py_1()
+                .cursor_pointer()
+                .text_color(rgb(0xdddddd))
+                .hover(|d| d.bg(rgb(0x3a5fcd)))
+                .child(label)
+        };
+
+        let mut items = div()
+            .flex()
+            .flex_col()
+            .bg(rgb(0x2a2a2a))
+            .border_1()
+            .border_color(rgb(0x444444))
+            .min_w(px(180.))
+            // Any click outside the menu (either mouse button) dismisses it.
+            .on_mouse_down_out(
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| this.close_menu(cx)),
+            );
+
+        if is_file {
+            items = items.child(
+                item("Open".to_string())
+                    .id("m-open")
+                    .on_click(cx.listener(|this, _, _window, cx| this.menu_open_default(cx))),
+            );
+
+            let apps = menu.apps.clone();
+            items = items.child(
+                item("Open With".to_string())
+                    .id("m-openwith")
+                    .on_mouse_move(cx.listener(|this, _, _window, cx| this.load_menu_apps(cx)))
+                    .child(match apps {
+                        None => div().into_any_element(),
+                        Some(list) if list.is_empty() => div()
+                            .text_color(rgb(0x888888))
+                            .child("No apps found")
+                            .into_any_element(),
+                        Some(list) => div()
+                            .flex()
+                            .flex_col()
+                            .children(list.into_iter().enumerate().map(|(idx, app)| {
+                                item(app.name.clone())
+                                    .id(("app", idx))
+                                    .on_click(cx.listener(move |this, _, _window, cx| {
+                                        this.menu_open_with(app.clone(), cx)
+                                    }))
+                            }))
+                            .into_any_element(),
+                    }),
+            );
+        }
+
+        items = items.child(
+            item("Open terminal here".to_string())
+                .id("m-term")
+                .on_click(cx.listener(|this, _, _window, cx| this.menu_open_terminal(cx))),
+        );
+
+        Some(
+            deferred(anchored().position(menu.pos).child(items))
+                .with_priority(1)
+                .into_any_element(),
+        )
+    }
 }
 
 fn render_meta(view: &MetaView) -> impl IntoElement {
@@ -401,10 +588,39 @@ impl Render for Mirufm {
                                             .when(Some(i) == selection, |d| d.bg(rgb(0x3a5fcd)))
                                             .text_color(rgb(0xdddddd))
                                             .on_click(cx.listener(
-                                                move |this, _event, _window, cx| {
+                                                move |this, event: &ClickEvent, _window, cx| {
+                                                    if event.click_count() >= 2 {
+                                                        if let Some(e) = this
+                                                            .state
+                                                            .columns
+                                                            .get(col)
+                                                            .and_then(|c| c.entries.get(i))
+                                                        {
+                                                            if e.kind != EntryKind::Dir {
+                                                                let path = e.path.clone();
+                                                                if let Err(err) =
+                                                                    crate::actions::open_default(
+                                                                        &path,
+                                                                    )
+                                                                {
+                                                                    this.notice = Some(format!(
+                                                                        "open failed: {err}"
+                                                                    ));
+                                                                    cx.notify();
+                                                                }
+                                                                return;
+                                                            }
+                                                        }
+                                                    }
                                                     this.descend(col, i, cx);
                                                 },
                                             ))
+                                            .on_mouse_down(
+                                                MouseButton::Right,
+                                                cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                                                    this.open_menu(col, i, event.position, cx);
+                                                }),
+                                            )
                                             .child(label),
                                     )
                                 })
@@ -430,12 +646,22 @@ impl Render for Mirufm {
             .flex_col()
             .size_full()
             .bg(rgb(0x1e1e1e))
+            .on_key_down(cx.listener(|this, e: &KeyDownEvent, _window, cx| {
+                if e.keystroke.key == "escape" && this.menu.is_some() {
+                    this.close_menu(cx);
+                }
+            }))
             .child(
                 div()
                     .px_2()
                     .py_1()
-                    .text_color(rgb(0x999999))
-                    .child(breadcrumb),
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .child(div().text_color(rgb(0x999999)).child(breadcrumb))
+                    .when_some(self.notice.clone(), |d, n| {
+                        d.child(div().text_color(rgb(0xcc7777)).child(n))
+                    }),
             )
             .child(
                 div()
@@ -448,5 +674,6 @@ impl Render for Mirufm {
                     .children(columns)
                     .child(self.render_preview()),
             )
+            .children(self.render_menu(cx))
     }
 }
