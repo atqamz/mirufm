@@ -275,12 +275,14 @@ impl Mirufm {
         };
 
         div()
+            .id("preview")
             .w(px(400.))
             .flex_none()
             .h_full()
             .p_2()
             .border_l_1()
             .border_color(rgb(0x333333))
+            .overflow_y_scroll()
             .child(body)
     }
 }
