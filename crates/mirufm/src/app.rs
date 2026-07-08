@@ -2,7 +2,7 @@ use std::future::Future;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::task::{Context as TaskContext, Poll, Waker};
 use std::thread;
@@ -13,6 +13,7 @@ use gpui::{
     Window,
 };
 use mirufm_core::fs::{read_dir, Entry, EntryKind};
+use mirufm_core::preview::{preview, MetaView, PreviewModel};
 use mirufm_core::scheduler::{Priority, Scheduler};
 use mirufm_core::sort::{sort, SortKey};
 use mirufm_core::state::{AppState, Stage};
@@ -71,6 +72,9 @@ pub struct Mirufm {
     strip_scroll: ScrollHandle,
     // Parallel to `state.columns`: watches the loaded directory at each depth.
     watchers: Vec<Option<watch::Watcher>>,
+    preview: Option<PreviewModel>,
+    // Flipped true to abort a superseded preview read (same own-Arc pattern as `load`).
+    preview_cancel: Option<Arc<AtomicBool>>,
 }
 
 impl Mirufm {
@@ -81,12 +85,20 @@ impl Mirufm {
             scheduler,
             strip_scroll: ScrollHandle::new(),
             watchers: vec![None],
+            preview: None,
+            preview_cancel: None,
         };
         me.load(root, cx);
         me
     }
 
     fn descend(&mut self, col: usize, entry_index: usize, cx: &mut Context<Self>) {
+        let clicked = self
+            .state
+            .columns
+            .get(col)
+            .and_then(|c| c.entries.get(entry_index))
+            .cloned();
         let to_load = self.state.descend(col, entry_index);
         // state.descend() may leave columns untouched (stale click index),
         // truncate to col + 1, or truncate then push a new column; derive
@@ -94,12 +106,49 @@ impl Mirufm {
         self.watchers
             .truncate(self.state.columns.len() - usize::from(to_load.is_some()));
         if let Some(path) = to_load {
+            // Descending into a directory: the pane clears (the directory opens as a column).
+            self.preview = None;
+            if let Some(old) = self.preview_cancel.take() {
+                old.store(true, Ordering::Relaxed);
+            }
             self.watchers.push(None); // matches the Loading column just pushed
             self.load(path, cx);
             self.strip_scroll.scroll_to_item(col + 1);
+        } else if let Some(entry) = clicked {
+            // Selecting a file (or symlink): preview it.
+            self.preview_entry(entry, cx);
         }
         debug_assert_eq!(self.watchers.len(), self.state.columns.len());
         cx.notify();
+    }
+
+    fn preview_entry(&mut self, entry: Entry, cx: &mut Context<Self>) {
+        // Supersede any in-flight preview.
+        if let Some(old) = self.preview_cancel.take() {
+            old.store(true, Ordering::Relaxed);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.preview_cancel = Some(cancel.clone());
+        let for_task = cancel.clone();
+
+        let (tx, rx) = mpsc::channel::<PreviewModel>();
+        self.scheduler.spawn(Priority::Preview, move |_cancel| {
+            let model = preview(&entry, &for_task);
+            let _ = tx.send(model);
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(model) = spawn_blocking(move || rx.recv()).await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                if !cancel.load(Ordering::Relaxed) {
+                    this.preview = Some(model);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn load(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -186,6 +235,117 @@ impl Mirufm {
             }
         })
         .detach();
+    }
+
+    fn render_preview(&self) -> impl IntoElement {
+        let body: AnyElement = match &self.preview {
+            None => div()
+                .text_color(rgb(0x666666))
+                .child("No selection")
+                .into_any_element(),
+            Some(PreviewModel::Text { content, truncated }) => {
+                let text = if *truncated {
+                    format!("{content}\n\n[truncated]")
+                } else {
+                    content.clone()
+                };
+                div()
+                    .font_family("monospace")
+                    .text_color(rgb(0xdddddd))
+                    .child(text)
+                    .into_any_element()
+            }
+            Some(PreviewModel::Dir { entries }) => div()
+                .flex()
+                .flex_col()
+                .children(entries.iter().map(|e| {
+                    let label = if e.kind == EntryKind::Dir {
+                        format!("{}/", e.name)
+                    } else {
+                        e.name.clone()
+                    };
+                    div().px_1().text_color(rgb(0xcccccc)).child(label)
+                }))
+                .into_any_element(),
+            Some(PreviewModel::Metadata(view)) => render_meta(view).into_any_element(),
+            Some(PreviewModel::Error(message)) => div()
+                .text_color(rgb(0xcc4444))
+                .child(message.clone())
+                .into_any_element(),
+        };
+
+        div()
+            .w(px(400.))
+            .flex_none()
+            .h_full()
+            .p_2()
+            .border_l_1()
+            .border_color(rgb(0x333333))
+            .child(body)
+    }
+}
+
+fn render_meta(view: &MetaView) -> impl IntoElement {
+    fn row(label: &str, value: String) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_row()
+            .gap_2()
+            .child(
+                div()
+                    .w(px(96.))
+                    .text_color(rgb(0x888888))
+                    .child(label.to_string()),
+            )
+            .child(div().text_color(rgb(0xcccccc)).child(value))
+    }
+
+    let kind = match view.kind {
+        EntryKind::Dir => "directory",
+        EntryKind::File => "file",
+        EntryKind::Symlink => "symlink",
+    };
+    let mode = format!("{:04o} {}", view.mode & 0o777, mode_rwx(view.mode));
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(row("name", view.name.clone()))
+        .child(row("type", kind.to_string()))
+        .child(row("size", human_size(view.size)))
+        .child(row("mode", mode))
+        .child(row("owner", format!("{}:{}", view.uid, view.gid)))
+        .when_some(view.symlink_target.as_ref(), |d, t| {
+            d.child(row("-> ", t.display().to_string()))
+        })
+}
+
+fn mode_rwx(mode: u32) -> String {
+    let bits = ['r', 'w', 'x'];
+    (0..9)
+        .map(|i| {
+            if mode & (1 << (8 - i)) != 0 {
+                bits[i % 3]
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
     }
 }
 
@@ -283,7 +443,8 @@ impl Render for Mirufm {
                     .flex_1()
                     .overflow_x_scroll()
                     .track_scroll(&self.strip_scroll)
-                    .children(columns),
+                    .children(columns)
+                    .child(self.render_preview()),
             )
     }
 }
