@@ -49,8 +49,11 @@ fn main() {
             }
         })
         .detach();
-        cx.open_window(WindowOptions::default(), |_, cx| {
-            cx.new(|cx| Mirufm::new(root, cx))
+        cx.open_window(WindowOptions::default(), |window, cx| {
+            let view = cx.new(|cx| Mirufm::new(root, cx));
+            let handle = view.read(cx).focus_handle();
+            window.focus(&handle, cx);
+            view
         })
         .unwrap();
         cx.activate(true);

@@ -89,6 +89,8 @@ pub struct Mirufm {
     menu: Option<ContextMenu>,
     // Transient status line shown in the header (spawn failures, "no terminal").
     notice: Option<String>,
+    // Focused on window open so the root receives key events (Escape closes the menu).
+    focus_handle: gpui::FocusHandle,
 }
 
 impl Mirufm {
@@ -103,9 +105,14 @@ impl Mirufm {
             preview_cancel: None,
             menu: None,
             notice: None,
+            focus_handle: cx.focus_handle(),
         };
         me.load(root, cx);
         me
+    }
+
+    pub fn focus_handle(&self) -> gpui::FocusHandle {
+        self.focus_handle.clone()
     }
 
     fn descend(&mut self, col: usize, entry_index: usize, cx: &mut Context<Self>) {
@@ -181,6 +188,7 @@ impl Mirufm {
     fn menu_open_default(&mut self, cx: &mut Context<Self>) {
         if let Some(menu) = &self.menu {
             if let Err(e) = crate::actions::open_default(&menu.target.path) {
+                tracing::warn!(path = %menu.target.path.display(), "open failed: {e}");
                 self.notice = Some(format!("open failed: {e}"));
             }
         }
@@ -191,8 +199,14 @@ impl Mirufm {
         if let Some(menu) = &self.menu {
             match crate::actions::open_terminal(&menu.dir) {
                 Ok(true) => {}
-                Ok(false) => self.notice = Some("set $TERMINAL or install a terminal".to_string()),
-                Err(e) => self.notice = Some(format!("terminal failed: {e}")),
+                Ok(false) => {
+                    tracing::warn!(dir = %menu.dir.display(), "no terminal found");
+                    self.notice = Some("set $TERMINAL or install a terminal".to_string());
+                }
+                Err(e) => {
+                    tracing::warn!(dir = %menu.dir.display(), "terminal failed: {e}");
+                    self.notice = Some(format!("terminal failed: {e}"));
+                }
             }
         }
         self.close_menu(cx);
@@ -201,6 +215,7 @@ impl Mirufm {
     fn menu_open_with(&mut self, app: DesktopApp, cx: &mut Context<Self>) {
         if let Some(menu) = &self.menu {
             if let Err(e) = crate::actions::open_with(&app, &menu.target.path) {
+                tracing::warn!(path = %menu.target.path.display(), app = %app.name, "open with failed: {e}");
                 self.notice = Some(format!("open with {} failed: {e}", app.name));
             }
         }
@@ -608,6 +623,7 @@ impl Render for Mirufm {
                                                                         &path,
                                                                     )
                                                                 {
+                                                                    tracing::warn!(path = %path.display(), "open failed: {err}");
                                                                     this.notice = Some(format!(
                                                                         "open failed: {err}"
                                                                     ));
@@ -647,6 +663,7 @@ impl Render for Mirufm {
             .collect::<Vec<_>>();
 
         div()
+            .track_focus(&self.focus_handle)
             .flex()
             .flex_col()
             .size_full()
