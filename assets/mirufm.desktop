@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=mirufm
+Comment=Fast Miller-column file explorer
+Exec=mirufm %f
+Terminal=false
+Categories=Utility;FileManager;
+MimeType=inode/directory;
