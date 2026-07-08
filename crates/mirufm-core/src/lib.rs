@@ -2,6 +2,7 @@
 //! No gpui, no async runtime. Callers supply threading.
 
 pub mod fs;
+pub mod launch;
 pub mod preview;
 pub mod scheduler;
 pub mod sort;
