@@ -8,10 +8,11 @@ license = "Apache-2.0"
 repository = "https://github.com/atqamz/mirufm"
 
 [workspace.dependencies]
-thiserror = "2"
-tempfile = "3"
 criterion = "0.8"
 notify = "8"
+tempfile = "3"
+thiserror = "2"
+trash = "5"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 gpui = { git = "https://github.com/zed-industries/zed", rev = "bc29bcfe728e3ce158f36b6a1b15f3dff667fe02" }

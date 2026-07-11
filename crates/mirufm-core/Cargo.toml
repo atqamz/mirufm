@@ -6,8 +6,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-thiserror.workspace = true
 notify.workspace = true
+thiserror.workspace = true
+trash.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

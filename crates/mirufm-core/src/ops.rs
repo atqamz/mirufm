@@ -87,6 +87,41 @@ pub fn rename(path: &Path, new_name: &str) -> Result<PathBuf, OpsError> {
     Ok(dest)
 }
 
+pub fn trash(paths: &[PathBuf]) -> Vec<(PathBuf, Result<(), OpsError>)> {
+    paths
+        .iter()
+        .map(|p| {
+            let r = trash::delete(p).map_err(|e| OpsError::Trash {
+                path: p.clone(),
+                message: e.to_string(),
+            });
+            (p.clone(), r)
+        })
+        .collect()
+}
+
+pub fn delete_permanent(paths: &[PathBuf]) -> Vec<(PathBuf, Result<(), OpsError>)> {
+    paths.iter().map(|p| (p.clone(), remove_any(p))).collect()
+}
+
+fn remove_any(path: &Path) -> Result<(), OpsError> {
+    // symlink_metadata does not follow the final symlink, so a link to a
+    // directory is removed as a link, not its target.
+    let meta = std::fs::symlink_metadata(path).map_err(|source| OpsError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let result = if meta.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    };
+    result.map_err(|source| OpsError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +219,47 @@ mod tests {
         std::fs::write(&a, b"x").unwrap();
         std::fs::write(&b, b"y").unwrap();
         assert!(matches!(rename(&a, "b.txt"), Err(OpsError::Exists(_))));
+    }
+
+    #[test]
+    fn delete_permanent_removes_file_and_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("f.txt");
+        let d = dir.path().join("d");
+        std::fs::write(&f, b"x").unwrap();
+        std::fs::create_dir(&d).unwrap();
+        std::fs::write(d.join("inner"), b"y").unwrap();
+
+        let results = delete_permanent(&[f.clone(), d.clone()]);
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|(_, r)| r.is_ok()));
+        assert!(!f.exists());
+        assert!(!d.exists());
+    }
+
+    #[test]
+    fn delete_permanent_reports_per_item_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope");
+        let results = delete_permanent(&[missing.clone()]);
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.is_err());
+    }
+
+    #[test]
+    fn trash_removes_from_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("t.txt");
+        std::fs::write(&f, b"x").unwrap();
+        let results = trash(&[f.clone()]);
+        assert_eq!(results.len(), 1);
+        // Trash may be unavailable in a sandboxed CI; accept either a clean
+        // removal or a reported Trash error, but never a panic or a left-behind
+        // file on success.
+        if results[0].1.is_ok() {
+            assert!(!f.exists());
+        } else {
+            assert!(matches!(results[0].1, Err(OpsError::Trash { .. })));
+        }
     }
 }
