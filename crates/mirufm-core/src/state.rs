@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -115,7 +115,7 @@ impl AppState {
             // different file and a following delete would hit the wrong entry.
             // Surviving paths keep their selection at the new index; vanished
             // paths drop out. The anchor is remapped or cleared the same way.
-            let selected_paths: Vec<PathBuf> = c
+            let selected_paths: HashSet<PathBuf> = c
                 .selected
                 .iter()
                 .filter_map(|&i| c.entries.get(i).map(|e| e.path.clone()))

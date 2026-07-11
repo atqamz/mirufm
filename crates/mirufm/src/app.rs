@@ -116,6 +116,9 @@ pub struct Mirufm {
     // source of the selection that copy / cut / rename / delete act on.
     active_col: usize,
     clipboard: Option<Clipboard>,
+    // True while a cut's move is dispatched but not yet resolved, so a rapid
+    // second paste does not re-run the move on already-moved sources.
+    cut_in_flight: bool,
     // Transient status line shown in the header (spawn failures, "no terminal").
     notice: Option<String>,
     // Focused on window open so the root receives key events (Escape closes the menu).
@@ -139,6 +142,7 @@ impl Mirufm {
             menu: None,
             active_col: 0,
             clipboard: None,
+            cut_in_flight: false,
             notice: None,
             focus_handle: cx.focus_handle(),
             editing: None,
@@ -291,6 +295,9 @@ impl Mirufm {
         let srcs = clip.paths.clone();
         let mode = clip.mode;
         let was_cut = mode == ClipMode::Cut;
+        if was_cut && self.cut_in_flight {
+            return;
+        }
 
         // A move empties the source directories too, so collect their distinct
         // parents to reload alongside the destination; dest_dir is reloaded
@@ -323,6 +330,10 @@ impl Mirufm {
             let _ = tx.send(notice);
         });
 
+        if was_cut {
+            self.cut_in_flight = true;
+        }
+
         cx.spawn(async move |this, cx| {
             let Ok(notice) = spawn_blocking(move || rx.recv()).await else {
                 return;
@@ -331,8 +342,11 @@ impl Mirufm {
                 // Clear the clipboard only when a cut fully succeeded, so a
                 // failed move leaves the source (and the clipboard) intact for a
                 // retry; a copy keeps the clipboard for repeat pastes.
-                if was_cut && notice.is_none() {
-                    this.clipboard = None;
+                if was_cut {
+                    this.cut_in_flight = false;
+                    if notice.is_none() {
+                        this.clipboard = None;
+                    }
                 }
                 this.notice = notice;
                 // Reload the destination and, for a move, each source parent so

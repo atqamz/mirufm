@@ -650,20 +650,27 @@ mod tests {
 
     #[test]
     fn move_non_exdev_rename_error_is_typed_not_copied() {
-        let src_dir = tempfile::tempdir().unwrap();
-        let dst_dir = tempfile::tempdir().unwrap();
-        let f = src_dir.path().join("a.txt");
-        std::fs::write(&f, b"x").unwrap();
+        let work = tempfile::tempdir().unwrap();
+        // The source is a directory so the two arms fail at different syscalls
+        // with different error paths, letting the assertion tell them apart.
+        let src = work.path().join("d");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("x.txt"), b"x").unwrap();
         // Point the "destination directory" at a regular file: rename fails with
-        // ENOTDIR (not EXDEV 18), so move_one returns a typed Io error via the
-        // direct-rename arm instead of taking the cross-device copy fallback.
-        let not_a_dir = dst_dir.path().join("file");
+        // ENOTDIR (not EXDEV 18). The direct-rename arm keys the Io error to the
+        // source; the cross-device copy fallback would instead fail inside
+        // create_dir and key the error to the destination, so asserting the
+        // error path is the source proves the fallback did not run.
+        let not_a_dir = work.path().join("file");
         std::fs::write(&not_a_dir, b"").unwrap();
 
-        let results = move_items(&[f.clone()], &not_a_dir);
+        let results = move_items(&[src.clone()], &not_a_dir);
         assert_eq!(results.len(), 1);
-        assert!(matches!(results[0].1, Err(OpsError::Io { .. })));
+        match &results[0].1 {
+            Err(OpsError::Io { path, .. }) => assert_eq!(path, &src),
+            other => panic!("expected an Io error keyed to the source, got {other:?}"),
+        }
         // Source preserved: the rename failed and there was no copy fallback.
-        assert!(f.exists());
+        assert!(src.exists());
     }
 }
