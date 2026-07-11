@@ -120,6 +120,8 @@ pub struct Mirufm {
     focus_handle: gpui::FocusHandle,
     // Active inline rename / new-folder edit, if any.
     editing: Option<Edit>,
+    // Set by Shift+Delete; the header shows a confirm strip until resolved.
+    pending_delete: Option<Vec<PathBuf>>,
 }
 
 impl Mirufm {
@@ -138,6 +140,7 @@ impl Mirufm {
             notice: None,
             focus_handle: cx.focus_handle(),
             editing: None,
+            pending_delete: None,
         };
         me.load(root, cx);
         me
@@ -212,7 +215,13 @@ impl Mirufm {
             .columns
             .get(col)
             .filter(|c| c.selected.len() == 1)
-            .and_then(|c| c.selected.iter().next().copied().and_then(|i| c.entries.get(i).cloned()));
+            .and_then(|c| {
+                c.selected
+                    .iter()
+                    .next()
+                    .copied()
+                    .and_then(|i| c.entries.get(i).cloned())
+            });
         match single {
             Some(entry) if entry.kind != EntryKind::Dir => self.preview_entry(entry, cx),
             _ => {
@@ -308,6 +317,86 @@ impl Mirufm {
                 // Reload the destination (and, for a move, the affected sources'
                 // parents) so the result shows immediately.
                 this.load(dest_dir.clone(), cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn trash_selection(&mut self, cx: &mut Context<Self>) {
+        let paths = self.selected_paths(self.active_col);
+        if paths.is_empty() {
+            return;
+        }
+        let dir = self
+            .state
+            .columns
+            .get(self.active_col)
+            .map(|c| c.path.clone());
+
+        let (tx, rx) = mpsc::channel::<Option<String>>();
+        self.scheduler.spawn(Priority::Preview, move |_cancel| {
+            let r = crate::actions::run_trash(&paths);
+            let _ = tx.send(crate::actions::batch_notice("trash", &r));
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(notice) = spawn_blocking(move || rx.recv()).await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                if let Some(n) = notice {
+                    this.notice = Some(n);
+                }
+                if let Some(dir) = dir {
+                    this.load(dir, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn request_permanent_delete(&mut self, cx: &mut Context<Self>) {
+        let paths = self.selected_paths(self.active_col);
+        if !paths.is_empty() {
+            self.pending_delete = Some(paths);
+            cx.notify();
+        }
+    }
+
+    fn cancel_delete(&mut self, cx: &mut Context<Self>) {
+        self.pending_delete = None;
+        cx.notify();
+    }
+
+    fn confirm_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(paths) = self.pending_delete.take() else {
+            return;
+        };
+        let dir = self
+            .state
+            .columns
+            .get(self.active_col)
+            .map(|c| c.path.clone());
+
+        let (tx, rx) = mpsc::channel::<Option<String>>();
+        self.scheduler.spawn(Priority::Preview, move |_cancel| {
+            let r = crate::actions::run_delete_permanent(&paths);
+            let _ = tx.send(crate::actions::batch_notice("delete", &r));
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(notice) = spawn_blocking(move || rx.recv()).await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                if let Some(n) = notice {
+                    this.notice = Some(n);
+                }
+                if let Some(dir) = dir {
+                    this.load(dir, cx);
+                }
                 cx.notify();
             })
             .ok();
@@ -787,22 +876,18 @@ impl Mirufm {
                 .on_click(cx.listener(|this, _, _window, cx| this.menu_open_terminal(cx))),
         );
 
-        items = items.child(
-            item("Copy".to_string())
-                .id("m-copy")
-                .on_click(cx.listener(|this, _, _window, cx| {
-                    this.copy_selection(cx);
-                    this.close_menu(cx);
-                })),
-        );
-        items = items.child(
-            item("Cut".to_string())
-                .id("m-cut")
-                .on_click(cx.listener(|this, _, _window, cx| {
-                    this.cut_selection(cx);
-                    this.close_menu(cx);
-                })),
-        );
+        items = items.child(item("Copy".to_string()).id("m-copy").on_click(cx.listener(
+            |this, _, _window, cx| {
+                this.copy_selection(cx);
+                this.close_menu(cx);
+            },
+        )));
+        items = items.child(item("Cut".to_string()).id("m-cut").on_click(cx.listener(
+            |this, _, _window, cx| {
+                this.cut_selection(cx);
+                this.close_menu(cx);
+            },
+        )));
         if self.clipboard.is_some() {
             items = items.child(
                 item("Paste".to_string())
@@ -827,6 +912,22 @@ impl Mirufm {
                 .id("m-mkdir")
                 .on_click(cx.listener(|this, _, _window, cx| {
                     this.begin_mkdir(cx);
+                    this.close_menu(cx);
+                })),
+        );
+        items = items.child(
+            item("Move to Trash".to_string())
+                .id("m-trash")
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    this.trash_selection(cx);
+                    this.close_menu(cx);
+                })),
+        );
+        items = items.child(
+            item("Delete Permanently".to_string())
+                .id("m-delete")
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    this.request_permanent_delete(cx);
                     this.close_menu(cx);
                 })),
         );
@@ -1055,6 +1156,15 @@ impl Render for Mirufm {
                 if this.edit_key(e, cx) {
                     return;
                 }
+                if this.pending_delete.is_some() {
+                    if e.keystroke.key == "enter" {
+                        this.confirm_delete(cx);
+                        return;
+                    } else if e.keystroke.key == "escape" {
+                        this.cancel_delete(cx);
+                        return;
+                    }
+                }
                 let key = e.keystroke.key.as_str();
                 let ctrl = e.keystroke.modifiers.control;
                 let shift = e.keystroke.modifiers.shift;
@@ -1070,6 +1180,10 @@ impl Render for Mirufm {
                     this.begin_rename(cx);
                 } else if ctrl && shift && key == "n" {
                     this.begin_mkdir(cx);
+                } else if key == "delete" && shift {
+                    this.request_permanent_delete(cx);
+                } else if key == "delete" {
+                    this.trash_selection(cx);
                 }
             }))
             .child(
@@ -1080,8 +1194,18 @@ impl Render for Mirufm {
                     .flex_row()
                     .justify_between()
                     .child(div().text_color(rgb(0x999999)).child(breadcrumb))
-                    .when_some(self.notice.clone(), |d, n| {
-                        d.child(div().text_color(rgb(0xcc7777)).child(n))
+                    .child(match &self.pending_delete {
+                        Some(paths) => div()
+                            .text_color(rgb(0xff8888))
+                            .child(format!(
+                                "Delete {} item(s) permanently? Enter to confirm, Esc to cancel",
+                                paths.len()
+                            ))
+                            .into_any_element(),
+                        None => match self.notice.clone() {
+                            Some(n) => div().text_color(rgb(0xcc7777)).child(n).into_any_element(),
+                            None => div().into_any_element(),
+                        },
                     }),
             )
             .child(

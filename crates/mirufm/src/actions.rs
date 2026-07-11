@@ -108,3 +108,13 @@ pub fn batch_notice<T>(verb: &str, results: &[(PathBuf, Result<T, OpsError>)]) -
         Some(format!("{verb}: {failed} of {} failed", results.len()))
     }
 }
+
+/// Move `paths` to trash, returning per-item results.
+pub fn run_trash(paths: &[PathBuf]) -> Vec<(PathBuf, Result<(), OpsError>)> {
+    ops::trash(paths)
+}
+
+/// Permanently delete `paths`, returning per-item results.
+pub fn run_delete_permanent(paths: &[PathBuf]) -> Vec<(PathBuf, Result<(), OpsError>)> {
+    ops::delete_permanent(paths)
+}
