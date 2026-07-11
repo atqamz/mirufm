@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -15,7 +15,8 @@ pub enum Stage {
 pub struct Column {
     pub path: PathBuf,
     pub entries: Vec<Entry>,
-    pub selection: Option<usize>,
+    pub selected: BTreeSet<usize>,
+    pub anchor: Option<usize>,
     pub stage: Stage,
 }
 
@@ -37,18 +38,44 @@ impl AppState {
             columns: vec![Column {
                 path: root,
                 entries: Vec::new(),
-                selection: None,
+                selected: BTreeSet::new(),
+                anchor: None,
                 stage: Stage::Loading,
             }],
             cache: HashMap::new(),
         }
     }
 
-    pub fn select(&mut self, col: usize, entry_index: usize) {
+    pub fn select(&mut self, col: usize, i: usize) {
         if let Some(c) = self.columns.get_mut(col) {
-            if entry_index < c.entries.len() {
-                c.selection = Some(entry_index);
+            if i < c.entries.len() {
+                c.selected.clear();
+                c.selected.insert(i);
+                c.anchor = Some(i);
             }
+        }
+    }
+
+    pub fn toggle(&mut self, col: usize, i: usize) {
+        if let Some(c) = self.columns.get_mut(col) {
+            if i < c.entries.len() {
+                if !c.selected.remove(&i) {
+                    c.selected.insert(i);
+                }
+                c.anchor = Some(i);
+            }
+        }
+    }
+
+    pub fn select_range(&mut self, col: usize, i: usize) {
+        if let Some(c) = self.columns.get_mut(col) {
+            if i >= c.entries.len() {
+                return;
+            }
+            let anchor = c.anchor.unwrap_or(i);
+            let (lo, hi) = if anchor <= i { (anchor, i) } else { (i, anchor) };
+            c.selected.clear();
+            c.selected.extend(lo..=hi.min(c.entries.len() - 1));
         }
     }
 
@@ -63,7 +90,8 @@ impl AppState {
         self.columns.push(Column {
             path: entry.path.clone(),
             entries: Vec::new(),
-            selection: None,
+            selected: BTreeSet::new(),
+            anchor: None,
             stage: Stage::Loading,
         });
         Some(entry.path)
@@ -86,6 +114,8 @@ impl AppState {
     pub fn set_error(&mut self, path: &Path, message: String) {
         if let Some(c) = self.columns.iter_mut().find(|c| c.path == path) {
             c.entries.clear();
+            c.selected.clear();
+            c.anchor = None;
             c.stage = Stage::Error(message);
         }
     }
@@ -143,7 +173,7 @@ mod tests {
         assert_eq!(to_load, Some(PathBuf::from("/root/sub")));
         assert_eq!(s.columns.len(), 2);
         assert_eq!(s.columns[1].stage, Stage::Loading);
-        assert_eq!(s.columns[0].selection, Some(0));
+        assert!(s.columns[0].selected.contains(&0));
     }
 
     #[test]
@@ -155,7 +185,7 @@ mod tests {
         let to_load = s.descend(0, 0);
         assert_eq!(to_load, None);
         assert_eq!(s.columns.len(), 1);
-        assert_eq!(s.columns[0].selection, Some(0));
+        assert!(s.columns[0].selected.contains(&0));
     }
 
     #[test]
@@ -196,5 +226,47 @@ mod tests {
             Stage::Error("permission denied".to_string())
         );
         assert!(s.columns[0].entries.is_empty());
+    }
+
+    #[test]
+    fn select_replaces_and_sets_anchor() {
+        let mut s = AppState::new(PathBuf::from("/root"));
+        let a = file_entry("a", Path::new("/root"));
+        let b = file_entry("b", Path::new("/root"));
+        s.set_loaded(Path::new("/root"), vec![a, b], SystemTime::UNIX_EPOCH);
+        s.select(0, 0);
+        s.select(0, 1);
+        assert_eq!(s.columns[0].selected.len(), 1);
+        assert!(s.columns[0].selected.contains(&1));
+        assert_eq!(s.columns[0].anchor, Some(1));
+    }
+
+    #[test]
+    fn toggle_adds_then_removes() {
+        let mut s = AppState::new(PathBuf::from("/root"));
+        let a = file_entry("a", Path::new("/root"));
+        let b = file_entry("b", Path::new("/root"));
+        s.set_loaded(Path::new("/root"), vec![a, b], SystemTime::UNIX_EPOCH);
+        s.select(0, 0);
+        s.toggle(0, 1);
+        assert!(s.columns[0].selected.contains(&0));
+        assert!(s.columns[0].selected.contains(&1));
+        s.toggle(0, 1);
+        assert!(!s.columns[0].selected.contains(&1));
+    }
+
+    #[test]
+    fn select_range_covers_anchor_to_index() {
+        let mut s = AppState::new(PathBuf::from("/root"));
+        let entries: Vec<_> = (0..5)
+            .map(|i| file_entry(&format!("f{i}"), Path::new("/root")))
+            .collect();
+        s.set_loaded(Path::new("/root"), entries, SystemTime::UNIX_EPOCH);
+        s.select(0, 1); // anchor = 1
+        s.select_range(0, 3);
+        assert_eq!(
+            s.columns[0].selected.iter().copied().collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
     }
 }
