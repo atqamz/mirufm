@@ -88,6 +88,18 @@ struct Clipboard {
     paths: Vec<PathBuf>,
 }
 
+#[derive(Clone, Copy)]
+enum EditKind {
+    Rename { idx: usize },
+    Mkdir,
+}
+
+struct Edit {
+    col: usize,
+    kind: EditKind,
+    buffer: String,
+}
+
 pub struct Mirufm {
     state: AppState,
     scheduler: Arc<Scheduler>,
@@ -106,6 +118,8 @@ pub struct Mirufm {
     notice: Option<String>,
     // Focused on window open so the root receives key events (Escape closes the menu).
     focus_handle: gpui::FocusHandle,
+    // Active inline rename / new-folder edit, if any.
+    editing: Option<Edit>,
 }
 
 impl Mirufm {
@@ -123,6 +137,7 @@ impl Mirufm {
             clipboard: None,
             notice: None,
             focus_handle: cx.focus_handle(),
+            editing: None,
         };
         me.load(root, cx);
         me
@@ -293,6 +308,125 @@ impl Mirufm {
                 // Reload the destination (and, for a move, the affected sources'
                 // parents) so the result shows immediately.
                 this.load(dest_dir.clone(), cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn begin_rename(&mut self, cx: &mut Context<Self>) {
+        let col = self.active_col;
+        let Some(c) = self.state.columns.get(col) else {
+            return;
+        };
+        if c.selected.len() != 1 {
+            return; // rename acts on exactly one entry
+        }
+        let idx = *c.selected.iter().next().unwrap();
+        let Some(entry) = c.entries.get(idx) else {
+            return;
+        };
+        self.editing = Some(Edit {
+            col,
+            kind: EditKind::Rename { idx },
+            buffer: entry.name.clone(),
+        });
+        cx.notify();
+    }
+
+    fn begin_mkdir(&mut self, cx: &mut Context<Self>) {
+        self.editing = Some(Edit {
+            col: self.active_col,
+            kind: EditKind::Mkdir,
+            buffer: String::new(),
+        });
+        cx.notify();
+    }
+
+    /// Feed a key to the active inline edit. Returns true if the key was
+    /// consumed (so the global keybind handler skips it).
+    fn edit_key(&mut self, e: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.editing.is_none() {
+            return false;
+        }
+        let key = e.keystroke.key.as_str();
+        match key {
+            "escape" => self.cancel_edit(cx),
+            "enter" => self.commit_edit(cx),
+            "backspace" => {
+                if let Some(edit) = &mut self.editing {
+                    edit.buffer.pop();
+                    cx.notify();
+                }
+            }
+            _ => {
+                if let Some(ch) = e.keystroke.key_char.as_ref() {
+                    // Ignore control chords; accept printable input only.
+                    if !e.keystroke.modifiers.control && !e.keystroke.modifiers.platform {
+                        if let Some(edit) = &mut self.editing {
+                            edit.buffer.push_str(ch);
+                            cx.notify();
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn cancel_edit(&mut self, cx: &mut Context<Self>) {
+        self.editing = None;
+        cx.notify();
+    }
+
+    fn commit_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.editing.take() else {
+            return;
+        };
+        let name = edit.buffer.trim().to_string();
+        if name.is_empty() {
+            cx.notify();
+            return;
+        }
+        let Some(dir) = self.state.columns.get(edit.col).map(|c| c.path.clone()) else {
+            return;
+        };
+        // Resolve the rename target path now (it needs current state); the op
+        // itself runs on the scheduler so the render thread never blocks on IO.
+        let target = match edit.kind {
+            EditKind::Rename { idx } => self
+                .state
+                .columns
+                .get(edit.col)
+                .and_then(|c| c.entries.get(idx))
+                .map(|e| e.path.clone()),
+            EditKind::Mkdir => None,
+        };
+        let kind = edit.kind;
+
+        let (tx, rx) = mpsc::channel::<Option<String>>();
+        let op_dir = dir.clone();
+        self.scheduler.spawn(Priority::Preview, move |_cancel| {
+            let result = match kind {
+                EditKind::Mkdir => mirufm_core::ops::mkdir(&op_dir, &name).map(|_| ()),
+                EditKind::Rename { .. } => match target {
+                    Some(path) => mirufm_core::ops::rename(&path, &name).map(|_| ()),
+                    None => Ok(()),
+                },
+            };
+            let _ = tx.send(result.err().map(|e| format!("{e}")));
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(notice) = spawn_blocking(move || rx.recv()).await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                if let Some(n) = notice {
+                    this.notice = Some(n);
+                }
+                // Reload the directory so the new / renamed entry appears.
+                this.load(dir.clone(), cx);
                 cx.notify();
             })
             .ok();
@@ -680,6 +814,23 @@ impl Mirufm {
             );
         }
 
+        items = items.child(
+            item("Rename".to_string())
+                .id("m-rename")
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    this.begin_rename(cx);
+                    this.close_menu(cx);
+                })),
+        );
+        items = items.child(
+            item("New Folder".to_string())
+                .id("m-mkdir")
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    this.begin_mkdir(cx);
+                    this.close_menu(cx);
+                })),
+        );
+
         Some(
             deferred(anchored().position(menu.pos).child(items))
                 .with_priority(1)
@@ -766,6 +917,14 @@ impl Render for Mirufm {
                 let column = &self.state.columns[col];
                 let selected = column.selected.clone();
                 let entry_count = column.entries.len();
+                let renaming = match &self.editing {
+                    Some(Edit {
+                        col: ec,
+                        kind: EditKind::Rename { idx },
+                        buffer,
+                    }) if *ec == col => Some((*idx, buffer.clone())),
+                    _ => None,
+                };
 
                 let body: AnyElement = if let Stage::Error(message) = &column.stage {
                     div()
@@ -788,10 +947,17 @@ impl Render for Mirufm {
                             range
                                 .filter_map(|i| {
                                     let e = column.entries.get(i)?;
-                                    let label = if e.kind == EntryKind::Dir {
-                                        format!("{}/", e.name)
-                                    } else {
-                                        e.name.clone()
+                                    let label = match &renaming {
+                                        Some((ridx, buf)) if *ridx == i => {
+                                            format!("{buf}\u{2502}")
+                                        }
+                                        _ => {
+                                            if e.kind == EntryKind::Dir {
+                                                format!("{}/", e.name)
+                                            } else {
+                                                e.name.clone()
+                                            }
+                                        }
                                     };
                                     Some(
                                         div()
@@ -849,13 +1015,33 @@ impl Render for Mirufm {
                     .into_any_element()
                 };
 
+                let mkdir_row: Option<AnyElement> = match &self.editing {
+                    Some(Edit {
+                        col: ec,
+                        kind: EditKind::Mkdir,
+                        buffer,
+                    }) if *ec == col => Some(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .bg(rgb(0x2a2a2a))
+                            .text_color(rgb(0xffffff))
+                            .child(format!("{buffer}\u{2502}"))
+                            .into_any_element(),
+                    ),
+                    _ => None,
+                };
+
                 div()
                     .w(px(256.))
                     .flex_none()
                     .h_full()
                     .border_r_1()
                     .border_color(rgb(0x333333))
-                    .child(body)
+                    .flex()
+                    .flex_col()
+                    .child(div().flex_1().min_h_0().child(body))
+                    .children(mkdir_row)
             })
             .collect::<Vec<_>>();
 
@@ -866,8 +1052,12 @@ impl Render for Mirufm {
             .size_full()
             .bg(rgb(0x1e1e1e))
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, _window, cx| {
+                if this.edit_key(e, cx) {
+                    return;
+                }
                 let key = e.keystroke.key.as_str();
                 let ctrl = e.keystroke.modifiers.control;
+                let shift = e.keystroke.modifiers.shift;
                 if key == "escape" && this.menu.is_some() {
                     this.close_menu(cx);
                 } else if ctrl && key == "c" {
@@ -876,6 +1066,10 @@ impl Render for Mirufm {
                     this.cut_selection(cx);
                 } else if ctrl && key == "v" {
                     this.paste(cx);
+                } else if key == "f2" {
+                    this.begin_rename(cx);
+                } else if ctrl && shift && key == "n" {
+                    this.begin_mkdir(cx);
                 }
             }))
             .child(
