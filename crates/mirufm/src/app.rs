@@ -87,6 +87,9 @@ pub struct Mirufm {
     // Flipped true to abort a superseded preview read (same own-Arc pattern as `load`).
     preview_cancel: Option<Arc<AtomicBool>>,
     menu: Option<ContextMenu>,
+    // The column the last click landed in; target for paste / mkdir and the
+    // source of the selection that copy / cut / rename / delete act on.
+    active_col: usize,
     // Transient status line shown in the header (spawn failures, "no terminal").
     notice: Option<String>,
     // Focused on window open so the root receives key events (Escape closes the menu).
@@ -104,6 +107,7 @@ impl Mirufm {
             preview: None,
             preview_cancel: None,
             menu: None,
+            active_col: 0,
             notice: None,
             focus_handle: cx.focus_handle(),
         };
@@ -116,6 +120,7 @@ impl Mirufm {
     }
 
     fn descend(&mut self, col: usize, entry_index: usize, cx: &mut Context<Self>) {
+        self.active_col = col;
         let clicked = self
             .state
             .columns
@@ -143,6 +148,52 @@ impl Mirufm {
         }
         debug_assert_eq!(self.watchers.len(), self.state.columns.len());
         cx.notify();
+    }
+
+    /// A left click on entry `i` of column `col`. Modifiers decide the mode:
+    /// ctrl toggles, shift range-selects (neither navigates), plain click
+    /// selects a single entry and then navigates (descend a dir / preview a
+    /// file) exactly as before.
+    fn click_entry(
+        &mut self,
+        col: usize,
+        i: usize,
+        ctrl: bool,
+        shift: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_col = col;
+        if ctrl {
+            self.state.toggle(col, i);
+            self.sync_preview(col, cx);
+            cx.notify();
+        } else if shift {
+            self.state.select_range(col, i);
+            self.sync_preview(col, cx);
+            cx.notify();
+        } else {
+            self.descend(col, i, cx);
+        }
+    }
+
+    /// Preview the sole selected entry of `col`, or clear the pane when the
+    /// selection is empty or multiple.
+    fn sync_preview(&mut self, col: usize, cx: &mut Context<Self>) {
+        let single = self
+            .state
+            .columns
+            .get(col)
+            .filter(|c| c.selected.len() == 1)
+            .and_then(|c| c.selected.iter().next().copied().and_then(|i| c.entries.get(i).cloned()));
+        match single {
+            Some(entry) if entry.kind != EntryKind::Dir => self.preview_entry(entry, cx),
+            _ => {
+                if let Some(old) = self.preview_cancel.take() {
+                    old.store(true, Ordering::Relaxed);
+                }
+                self.preview = None;
+            }
+        }
     }
 
     fn open_menu(
@@ -570,7 +621,7 @@ impl Render for Mirufm {
         let columns = (0..self.state.columns.len())
             .map(|col| {
                 let column = &self.state.columns[col];
-                let selection = column.selection;
+                let selected = column.selected.clone();
                 let entry_count = column.entries.len();
 
                 let body: AnyElement = if let Stage::Error(message) = &column.stage {
@@ -605,7 +656,7 @@ impl Render for Mirufm {
                                             .px_2()
                                             .py_1()
                                             .cursor_pointer()
-                                            .when(Some(i) == selection, |d| d.bg(rgb(0x3a5fcd)))
+                                            .when(selected.contains(&i), |d| d.bg(rgb(0x3a5fcd)))
                                             .text_color(rgb(0xdddddd))
                                             .on_click(cx.listener(
                                                 move |this, event: &ClickEvent, _window, cx| {
@@ -633,7 +684,10 @@ impl Render for Mirufm {
                                                             }
                                                         }
                                                     }
-                                                    this.descend(col, i, cx);
+                                                    let mods = event.modifiers();
+                                                    this.click_entry(
+                                                        col, i, mods.control, mods.shift, cx,
+                                                    );
                                                 },
                                             ))
                                             .on_mouse_down(
