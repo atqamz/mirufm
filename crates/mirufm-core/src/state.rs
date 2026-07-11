@@ -73,7 +73,11 @@ impl AppState {
                 return;
             }
             let anchor = c.anchor.unwrap_or(i);
-            let (lo, hi) = if anchor <= i { (anchor, i) } else { (i, anchor) };
+            let (lo, hi) = if anchor <= i {
+                (anchor, i)
+            } else {
+                (i, anchor)
+            };
             c.selected.clear();
             c.selected.extend(lo..=hi.min(c.entries.len() - 1));
         }
