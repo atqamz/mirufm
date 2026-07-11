@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use mirufm_core::launch::{apps_for_mime, exec_argv, terminal_command, DesktopApp};
+use mirufm_core::ops::{self, OpsError};
 
 /// XDG application directories, user dir first (it shadows system dirs).
 pub fn app_search_dirs() -> Vec<PathBuf> {
@@ -85,4 +86,25 @@ pub fn open_with(app: &DesktopApp, path: &Path) -> std::io::Result<()> {
         return Ok(());
     }
     Command::new(&argv[0]).args(&argv[1..]).spawn().map(|_| ())
+}
+
+/// Copy `srcs` into `dest_dir`, returning per-item results.
+pub fn run_copy(srcs: &[PathBuf], dest_dir: &Path) -> Vec<(PathBuf, Result<PathBuf, OpsError>)> {
+    ops::copy(srcs, dest_dir)
+}
+
+/// Move `srcs` into `dest_dir`, returning per-item results.
+pub fn run_move(srcs: &[PathBuf], dest_dir: &Path) -> Vec<(PathBuf, Result<PathBuf, OpsError>)> {
+    ops::move_items(srcs, dest_dir)
+}
+
+/// Count the failures in a batch result and format a notice, or `None` if all
+/// items succeeded.
+pub fn batch_notice<T>(verb: &str, results: &[(PathBuf, Result<T, OpsError>)]) -> Option<String> {
+    let failed = results.iter().filter(|(_, r)| r.is_err()).count();
+    if failed == 0 {
+        None
+    } else {
+        Some(format!("{verb}: {failed} of {} failed", results.len()))
+    }
 }

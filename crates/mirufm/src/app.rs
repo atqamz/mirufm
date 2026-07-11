@@ -77,6 +77,17 @@ struct ContextMenu {
     apps: Option<Vec<DesktopApp>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClipMode {
+    Copy,
+    Cut,
+}
+
+struct Clipboard {
+    mode: ClipMode,
+    paths: Vec<PathBuf>,
+}
+
 pub struct Mirufm {
     state: AppState,
     scheduler: Arc<Scheduler>,
@@ -90,6 +101,7 @@ pub struct Mirufm {
     // The column the last click landed in; target for paste / mkdir and the
     // source of the selection that copy / cut / rename / delete act on.
     active_col: usize,
+    clipboard: Option<Clipboard>,
     // Transient status line shown in the header (spawn failures, "no terminal").
     notice: Option<String>,
     // Focused on window open so the root receives key events (Escape closes the menu).
@@ -108,6 +120,7 @@ impl Mirufm {
             preview_cancel: None,
             menu: None,
             active_col: 0,
+            clipboard: None,
             notice: None,
             focus_handle: cx.focus_handle(),
         };
@@ -196,6 +209,97 @@ impl Mirufm {
         }
     }
 
+    /// Snapshot the active column's selected paths into the clipboard.
+    fn selected_paths(&self, col: usize) -> Vec<PathBuf> {
+        self.state
+            .columns
+            .get(col)
+            .map(|c| {
+                c.selected
+                    .iter()
+                    .filter_map(|&i| c.entries.get(i).map(|e| e.path.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        let paths = self.selected_paths(self.active_col);
+        if !paths.is_empty() {
+            self.clipboard = Some(Clipboard {
+                mode: ClipMode::Copy,
+                paths,
+            });
+            cx.notify();
+        }
+    }
+
+    fn cut_selection(&mut self, cx: &mut Context<Self>) {
+        let paths = self.selected_paths(self.active_col);
+        if !paths.is_empty() {
+            self.clipboard = Some(Clipboard {
+                mode: ClipMode::Cut,
+                paths,
+            });
+            cx.notify();
+        }
+    }
+
+    fn paste(&mut self, cx: &mut Context<Self>) {
+        let Some(clip) = &self.clipboard else {
+            return;
+        };
+        let Some(dest_dir) = self
+            .state
+            .columns
+            .get(self.active_col)
+            .map(|c| c.path.clone())
+        else {
+            return;
+        };
+        let srcs = clip.paths.clone();
+        let mode = clip.mode;
+
+        let (tx, rx) = mpsc::channel::<Option<String>>();
+        let dest = dest_dir.clone();
+        self.scheduler.spawn(Priority::Preview, move |_cancel| {
+            let notice = match mode {
+                ClipMode::Copy => {
+                    let r = crate::actions::run_copy(&srcs, &dest);
+                    crate::actions::batch_notice("copy", &r)
+                }
+                ClipMode::Cut => {
+                    let r = crate::actions::run_move(&srcs, &dest);
+                    crate::actions::batch_notice("move", &r)
+                }
+            };
+            let _ = tx.send(notice);
+        });
+
+        // A cut clears the clipboard once consumed; a copy keeps it for repeat
+        // pastes.
+        if mode == ClipMode::Cut {
+            self.clipboard = None;
+        }
+
+        cx.spawn(async move |this, cx| {
+            let Ok(notice) = spawn_blocking(move || rx.recv()).await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                if let Some(n) = notice {
+                    this.notice = Some(n);
+                }
+                // Reload the destination (and, for a move, the affected sources'
+                // parents) so the result shows immediately.
+                this.load(dest_dir.clone(), cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn open_menu(
         &mut self,
         col: usize,
@@ -203,6 +307,7 @@ impl Mirufm {
         pos: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
+        self.active_col = col;
         let Some(entry) = self
             .state
             .columns
@@ -212,6 +317,17 @@ impl Mirufm {
         else {
             return;
         };
+        // If the clicked entry is outside the current selection, reset to it
+        // so the menu acts on what was clicked.
+        let already = self
+            .state
+            .columns
+            .get(col)
+            .map(|c| c.selected.contains(&entry_index))
+            .unwrap_or(false);
+        if !already {
+            self.state.select(col, entry_index);
+        }
         let dir = if entry.kind == EntryKind::Dir {
             entry.path.clone()
         } else {
@@ -537,6 +653,33 @@ impl Mirufm {
                 .on_click(cx.listener(|this, _, _window, cx| this.menu_open_terminal(cx))),
         );
 
+        items = items.child(
+            item("Copy".to_string())
+                .id("m-copy")
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    this.copy_selection(cx);
+                    this.close_menu(cx);
+                })),
+        );
+        items = items.child(
+            item("Cut".to_string())
+                .id("m-cut")
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    this.cut_selection(cx);
+                    this.close_menu(cx);
+                })),
+        );
+        if self.clipboard.is_some() {
+            items = items.child(
+                item("Paste".to_string())
+                    .id("m-paste")
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.paste(cx);
+                        this.close_menu(cx);
+                    })),
+            );
+        }
+
         Some(
             deferred(anchored().position(menu.pos).child(items))
                 .with_priority(1)
@@ -723,8 +866,16 @@ impl Render for Mirufm {
             .size_full()
             .bg(rgb(0x1e1e1e))
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, _window, cx| {
-                if e.keystroke.key == "escape" && this.menu.is_some() {
+                let key = e.keystroke.key.as_str();
+                let ctrl = e.keystroke.modifiers.control;
+                if key == "escape" && this.menu.is_some() {
                     this.close_menu(cx);
+                } else if ctrl && key == "c" {
+                    this.copy_selection(cx);
+                } else if ctrl && key == "x" {
+                    this.cut_selection(cx);
+                } else if ctrl && key == "v" {
+                    this.paste(cx);
                 }
             }))
             .child(
