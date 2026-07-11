@@ -3,6 +3,7 @@
 
 pub mod fs;
 pub mod launch;
+pub mod ops;
 pub mod preview;
 pub mod scheduler;
 pub mod sort;

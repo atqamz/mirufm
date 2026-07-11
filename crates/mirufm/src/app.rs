@@ -77,6 +77,31 @@ struct ContextMenu {
     apps: Option<Vec<DesktopApp>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClipMode {
+    Copy,
+    Cut,
+}
+
+struct Clipboard {
+    mode: ClipMode,
+    paths: Vec<PathBuf>,
+}
+
+#[derive(Clone)]
+enum EditKind {
+    // `path` is captured at begin_rename time so a reload cannot make the
+    // commit target a different file; `idx` is kept only to render the row.
+    Rename { idx: usize, path: PathBuf },
+    Mkdir,
+}
+
+struct Edit {
+    col: usize,
+    kind: EditKind,
+    buffer: String,
+}
+
 pub struct Mirufm {
     state: AppState,
     scheduler: Arc<Scheduler>,
@@ -87,10 +112,21 @@ pub struct Mirufm {
     // Flipped true to abort a superseded preview read (same own-Arc pattern as `load`).
     preview_cancel: Option<Arc<AtomicBool>>,
     menu: Option<ContextMenu>,
+    // The column the last click landed in; target for paste / mkdir and the
+    // source of the selection that copy / cut / rename / delete act on.
+    active_col: usize,
+    clipboard: Option<Clipboard>,
+    // True while a cut's move is dispatched but not yet resolved, so a rapid
+    // second paste does not re-run the move on already-moved sources.
+    cut_in_flight: bool,
     // Transient status line shown in the header (spawn failures, "no terminal").
     notice: Option<String>,
     // Focused on window open so the root receives key events (Escape closes the menu).
     focus_handle: gpui::FocusHandle,
+    // Active inline rename / new-folder edit, if any.
+    editing: Option<Edit>,
+    // Set by Shift+Delete; the header shows a confirm strip until resolved.
+    pending_delete: Option<Vec<PathBuf>>,
 }
 
 impl Mirufm {
@@ -104,8 +140,13 @@ impl Mirufm {
             preview: None,
             preview_cancel: None,
             menu: None,
+            active_col: 0,
+            clipboard: None,
+            cut_in_flight: false,
             notice: None,
             focus_handle: cx.focus_handle(),
+            editing: None,
+            pending_delete: None,
         };
         me.load(root, cx);
         me
@@ -116,6 +157,7 @@ impl Mirufm {
     }
 
     fn descend(&mut self, col: usize, entry_index: usize, cx: &mut Context<Self>) {
+        self.active_col = col;
         let clicked = self
             .state
             .columns
@@ -145,6 +187,373 @@ impl Mirufm {
         cx.notify();
     }
 
+    /// A left click on entry `i` of column `col`. Modifiers decide the mode:
+    /// ctrl toggles, shift range-selects (neither navigates), plain click
+    /// selects a single entry and then navigates (descend a dir / preview a
+    /// file) exactly as before.
+    fn click_entry(
+        &mut self,
+        col: usize,
+        i: usize,
+        ctrl: bool,
+        shift: bool,
+        cx: &mut Context<Self>,
+    ) {
+        // A click away from an open inline edit dismisses it (cancel, not
+        // commit) before the click is handled, so it stops capturing keys.
+        if self.editing.is_some() {
+            self.cancel_edit(cx);
+        }
+        self.active_col = col;
+        if ctrl {
+            self.state.toggle(col, i);
+            self.sync_preview(col, cx);
+            cx.notify();
+        } else if shift {
+            self.state.select_range(col, i);
+            self.sync_preview(col, cx);
+            cx.notify();
+        } else {
+            self.descend(col, i, cx);
+        }
+    }
+
+    /// Preview the sole selected entry of `col`, or clear the pane when the
+    /// selection is empty or multiple.
+    fn sync_preview(&mut self, col: usize, cx: &mut Context<Self>) {
+        let single = self
+            .state
+            .columns
+            .get(col)
+            .filter(|c| c.selected.len() == 1)
+            .and_then(|c| {
+                c.selected
+                    .iter()
+                    .next()
+                    .copied()
+                    .and_then(|i| c.entries.get(i).cloned())
+            });
+        match single {
+            Some(entry) if entry.kind != EntryKind::Dir => self.preview_entry(entry, cx),
+            _ => {
+                if let Some(old) = self.preview_cancel.take() {
+                    old.store(true, Ordering::Relaxed);
+                }
+                self.preview = None;
+            }
+        }
+    }
+
+    /// Snapshot the active column's selected paths into the clipboard.
+    fn selected_paths(&self, col: usize) -> Vec<PathBuf> {
+        self.state
+            .columns
+            .get(col)
+            .map(|c| {
+                c.selected
+                    .iter()
+                    .filter_map(|&i| c.entries.get(i).map(|e| e.path.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        let paths = self.selected_paths(self.active_col);
+        if !paths.is_empty() {
+            self.clipboard = Some(Clipboard {
+                mode: ClipMode::Copy,
+                paths,
+            });
+            cx.notify();
+        }
+    }
+
+    fn cut_selection(&mut self, cx: &mut Context<Self>) {
+        let paths = self.selected_paths(self.active_col);
+        if !paths.is_empty() {
+            self.clipboard = Some(Clipboard {
+                mode: ClipMode::Cut,
+                paths,
+            });
+            cx.notify();
+        }
+    }
+
+    fn paste(&mut self, cx: &mut Context<Self>) {
+        let Some(clip) = &self.clipboard else {
+            return;
+        };
+        let Some(dest_dir) = self
+            .state
+            .columns
+            .get(self.active_col)
+            .map(|c| c.path.clone())
+        else {
+            return;
+        };
+        let srcs = clip.paths.clone();
+        let mode = clip.mode;
+        let was_cut = mode == ClipMode::Cut;
+        if was_cut && self.cut_in_flight {
+            return;
+        }
+
+        // A move empties the source directories too, so collect their distinct
+        // parents to reload alongside the destination; dest_dir is reloaded
+        // unconditionally below, so skip it here.
+        let mut source_parents: Vec<PathBuf> = Vec::new();
+        if was_cut {
+            for src in &srcs {
+                if let Some(parent) = src.parent() {
+                    let parent = parent.to_path_buf();
+                    if parent != dest_dir && !source_parents.contains(&parent) {
+                        source_parents.push(parent);
+                    }
+                }
+            }
+        }
+
+        let (tx, rx) = mpsc::channel::<Option<String>>();
+        let dest = dest_dir.clone();
+        self.scheduler.spawn(Priority::Preview, move |_cancel| {
+            let notice = match mode {
+                ClipMode::Copy => {
+                    let r = crate::actions::run_copy(&srcs, &dest);
+                    crate::actions::batch_notice("copy", &r)
+                }
+                ClipMode::Cut => {
+                    let r = crate::actions::run_move(&srcs, &dest);
+                    crate::actions::batch_notice("move", &r)
+                }
+            };
+            let _ = tx.send(notice);
+        });
+
+        if was_cut {
+            self.cut_in_flight = true;
+        }
+
+        cx.spawn(async move |this, cx| {
+            let Ok(notice) = spawn_blocking(move || rx.recv()).await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                // Clear the clipboard only when a cut fully succeeded, so a
+                // failed move leaves the source (and the clipboard) intact for a
+                // retry; a copy keeps the clipboard for repeat pastes.
+                if was_cut {
+                    this.cut_in_flight = false;
+                    if notice.is_none() {
+                        this.clipboard = None;
+                    }
+                }
+                this.notice = notice;
+                // Reload the destination and, for a move, each source parent so
+                // both sides of the move show the result immediately.
+                this.load(dest_dir.clone(), cx);
+                for parent in &source_parents {
+                    this.load(parent.clone(), cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn trash_selection(&mut self, cx: &mut Context<Self>) {
+        let paths = self.selected_paths(self.active_col);
+        if paths.is_empty() {
+            return;
+        }
+        let dir = self
+            .state
+            .columns
+            .get(self.active_col)
+            .map(|c| c.path.clone());
+
+        let (tx, rx) = mpsc::channel::<Option<String>>();
+        self.scheduler.spawn(Priority::Preview, move |_cancel| {
+            let r = crate::actions::run_trash(&paths);
+            let _ = tx.send(crate::actions::batch_notice("trash", &r));
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(notice) = spawn_blocking(move || rx.recv()).await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.notice = notice;
+                if let Some(dir) = dir {
+                    this.load(dir, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn request_permanent_delete(&mut self, cx: &mut Context<Self>) {
+        let paths = self.selected_paths(self.active_col);
+        if !paths.is_empty() {
+            self.pending_delete = Some(paths);
+            cx.notify();
+        }
+    }
+
+    fn cancel_delete(&mut self, cx: &mut Context<Self>) {
+        self.pending_delete = None;
+        cx.notify();
+    }
+
+    fn confirm_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(paths) = self.pending_delete.take() else {
+            return;
+        };
+        // Reload the directories that actually lost files - the frozen paths'
+        // distinct parents - not the currently active column: the user may have
+        // navigated away between requesting and confirming the delete.
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for p in &paths {
+            if let Some(parent) = p.parent() {
+                let parent = parent.to_path_buf();
+                if !dirs.contains(&parent) {
+                    dirs.push(parent);
+                }
+            }
+        }
+
+        let (tx, rx) = mpsc::channel::<Option<String>>();
+        self.scheduler.spawn(Priority::Preview, move |_cancel| {
+            let r = crate::actions::run_delete_permanent(&paths);
+            let _ = tx.send(crate::actions::batch_notice("delete", &r));
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(notice) = spawn_blocking(move || rx.recv()).await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.notice = notice;
+                for dir in &dirs {
+                    this.load(dir.clone(), cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn begin_rename(&mut self, cx: &mut Context<Self>) {
+        let col = self.active_col;
+        let Some(c) = self.state.columns.get(col) else {
+            return;
+        };
+        if c.selected.len() != 1 {
+            return; // rename acts on exactly one entry
+        }
+        let idx = *c.selected.iter().next().unwrap();
+        let Some(entry) = c.entries.get(idx) else {
+            return;
+        };
+        self.editing = Some(Edit {
+            col,
+            kind: EditKind::Rename {
+                idx,
+                path: entry.path.clone(),
+            },
+            buffer: entry.name.clone(),
+        });
+        cx.notify();
+    }
+
+    fn begin_mkdir(&mut self, cx: &mut Context<Self>) {
+        self.editing = Some(Edit {
+            col: self.active_col,
+            kind: EditKind::Mkdir,
+            buffer: String::new(),
+        });
+        cx.notify();
+    }
+
+    /// Feed a key to the active inline edit. Returns true if the key was
+    /// consumed (so the global keybind handler skips it).
+    fn edit_key(&mut self, e: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        if self.editing.is_none() {
+            return false;
+        }
+        let key = e.keystroke.key.as_str();
+        match key {
+            "escape" => self.cancel_edit(cx),
+            "enter" => self.commit_edit(cx),
+            "backspace" => {
+                if let Some(edit) = &mut self.editing {
+                    edit.buffer.pop();
+                    cx.notify();
+                }
+            }
+            _ => {
+                if let Some(ch) = e.keystroke.key_char.as_ref() {
+                    // Ignore control chords; accept printable input only.
+                    if !e.keystroke.modifiers.control && !e.keystroke.modifiers.platform {
+                        if let Some(edit) = &mut self.editing {
+                            edit.buffer.push_str(ch);
+                            cx.notify();
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn cancel_edit(&mut self, cx: &mut Context<Self>) {
+        self.editing = None;
+        cx.notify();
+    }
+
+    fn commit_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.editing.take() else {
+            return;
+        };
+        let name = edit.buffer.trim().to_string();
+        if name.is_empty() {
+            cx.notify();
+            return;
+        }
+        let Some(dir) = self.state.columns.get(edit.col).map(|c| c.path.clone()) else {
+            return;
+        };
+        // The rename path was captured at begin_rename time, so a reload between
+        // then and now cannot redirect the op at a different file. The op runs on
+        // the scheduler so the render thread never blocks on IO.
+        let kind = edit.kind;
+
+        let (tx, rx) = mpsc::channel::<Option<String>>();
+        let op_dir = dir.clone();
+        self.scheduler.spawn(Priority::Preview, move |_cancel| {
+            let result = match kind {
+                EditKind::Mkdir => mirufm_core::ops::mkdir(&op_dir, &name).map(|_| ()),
+                EditKind::Rename { path, .. } => mirufm_core::ops::rename(&path, &name).map(|_| ()),
+            };
+            let _ = tx.send(result.err().map(|e| format!("{e}")));
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(notice) = spawn_blocking(move || rx.recv()).await else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.notice = notice;
+                // Reload the directory so the new / renamed entry appears.
+                this.load(dir.clone(), cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn open_menu(
         &mut self,
         col: usize,
@@ -152,6 +561,7 @@ impl Mirufm {
         pos: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
+        self.active_col = col;
         let Some(entry) = self
             .state
             .columns
@@ -161,6 +571,17 @@ impl Mirufm {
         else {
             return;
         };
+        // If the clicked entry is outside the current selection, reset to it
+        // so the menu acts on what was clicked.
+        let already = self
+            .state
+            .columns
+            .get(col)
+            .map(|c| c.selected.contains(&entry_index))
+            .unwrap_or(false);
+        if !already {
+            self.state.select(col, entry_index);
+        }
         let dir = if entry.kind == EntryKind::Dir {
             entry.path.clone()
         } else {
@@ -486,6 +907,62 @@ impl Mirufm {
                 .on_click(cx.listener(|this, _, _window, cx| this.menu_open_terminal(cx))),
         );
 
+        items = items.child(item("Copy".to_string()).id("m-copy").on_click(cx.listener(
+            |this, _, _window, cx| {
+                this.copy_selection(cx);
+                this.close_menu(cx);
+            },
+        )));
+        items = items.child(item("Cut".to_string()).id("m-cut").on_click(cx.listener(
+            |this, _, _window, cx| {
+                this.cut_selection(cx);
+                this.close_menu(cx);
+            },
+        )));
+        if self.clipboard.is_some() {
+            items = items.child(
+                item("Paste".to_string())
+                    .id("m-paste")
+                    .on_click(cx.listener(|this, _, _window, cx| {
+                        this.paste(cx);
+                        this.close_menu(cx);
+                    })),
+            );
+        }
+
+        items = items.child(
+            item("Rename".to_string())
+                .id("m-rename")
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    this.begin_rename(cx);
+                    this.close_menu(cx);
+                })),
+        );
+        items = items.child(
+            item("New Folder".to_string())
+                .id("m-mkdir")
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    this.begin_mkdir(cx);
+                    this.close_menu(cx);
+                })),
+        );
+        items = items.child(
+            item("Move to Trash".to_string())
+                .id("m-trash")
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    this.trash_selection(cx);
+                    this.close_menu(cx);
+                })),
+        );
+        items = items.child(
+            item("Delete Permanently".to_string())
+                .id("m-delete")
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    this.request_permanent_delete(cx);
+                    this.close_menu(cx);
+                })),
+        );
+
         Some(
             deferred(anchored().position(menu.pos).child(items))
                 .with_priority(1)
@@ -570,8 +1047,16 @@ impl Render for Mirufm {
         let columns = (0..self.state.columns.len())
             .map(|col| {
                 let column = &self.state.columns[col];
-                let selection = column.selection;
+                let selected = column.selected.clone();
                 let entry_count = column.entries.len();
+                let renaming = match &self.editing {
+                    Some(Edit {
+                        col: ec,
+                        kind: EditKind::Rename { idx, .. },
+                        buffer,
+                    }) if *ec == col => Some((*idx, buffer.clone())),
+                    _ => None,
+                };
 
                 let body: AnyElement = if let Stage::Error(message) = &column.stage {
                     div()
@@ -594,10 +1079,17 @@ impl Render for Mirufm {
                             range
                                 .filter_map(|i| {
                                     let e = column.entries.get(i)?;
-                                    let label = if e.kind == EntryKind::Dir {
-                                        format!("{}/", e.name)
-                                    } else {
-                                        e.name.clone()
+                                    let label = match &renaming {
+                                        Some((ridx, buf)) if *ridx == i => {
+                                            format!("{buf}\u{2502}")
+                                        }
+                                        _ => {
+                                            if e.kind == EntryKind::Dir {
+                                                format!("{}/", e.name)
+                                            } else {
+                                                e.name.clone()
+                                            }
+                                        }
                                     };
                                     Some(
                                         div()
@@ -605,7 +1097,7 @@ impl Render for Mirufm {
                                             .px_2()
                                             .py_1()
                                             .cursor_pointer()
-                                            .when(Some(i) == selection, |d| d.bg(rgb(0x3a5fcd)))
+                                            .when(selected.contains(&i), |d| d.bg(rgb(0x3a5fcd)))
                                             .text_color(rgb(0xdddddd))
                                             .on_click(cx.listener(
                                                 move |this, event: &ClickEvent, _window, cx| {
@@ -633,7 +1125,10 @@ impl Render for Mirufm {
                                                             }
                                                         }
                                                     }
-                                                    this.descend(col, i, cx);
+                                                    let mods = event.modifiers();
+                                                    this.click_entry(
+                                                        col, i, mods.control, mods.shift, cx,
+                                                    );
                                                 },
                                             ))
                                             .on_mouse_down(
@@ -652,13 +1147,33 @@ impl Render for Mirufm {
                     .into_any_element()
                 };
 
+                let mkdir_row: Option<AnyElement> = match &self.editing {
+                    Some(Edit {
+                        col: ec,
+                        kind: EditKind::Mkdir,
+                        buffer,
+                    }) if *ec == col => Some(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .bg(rgb(0x2a2a2a))
+                            .text_color(rgb(0xffffff))
+                            .child(format!("{buffer}\u{2502}"))
+                            .into_any_element(),
+                    ),
+                    _ => None,
+                };
+
                 div()
                     .w(px(256.))
                     .flex_none()
                     .h_full()
                     .border_r_1()
                     .border_color(rgb(0x333333))
-                    .child(body)
+                    .flex()
+                    .flex_col()
+                    .child(div().flex_1().min_h_0().child(body))
+                    .children(mkdir_row)
             })
             .collect::<Vec<_>>();
 
@@ -669,8 +1184,39 @@ impl Render for Mirufm {
             .size_full()
             .bg(rgb(0x1e1e1e))
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, _window, cx| {
-                if e.keystroke.key == "escape" && this.menu.is_some() {
+                if this.edit_key(e, cx) {
+                    return;
+                }
+                if this.pending_delete.is_some() {
+                    // The confirm strip is modal: Enter confirms, Escape
+                    // cancels, and every other key is swallowed so no
+                    // destructive or state-changing action fires underneath it.
+                    if e.keystroke.key == "enter" {
+                        this.confirm_delete(cx);
+                    } else if e.keystroke.key == "escape" {
+                        this.cancel_delete(cx);
+                    }
+                    return;
+                }
+                let key = e.keystroke.key.as_str();
+                let ctrl = e.keystroke.modifiers.control;
+                let shift = e.keystroke.modifiers.shift;
+                if key == "escape" && this.menu.is_some() {
                     this.close_menu(cx);
+                } else if ctrl && key == "c" {
+                    this.copy_selection(cx);
+                } else if ctrl && key == "x" {
+                    this.cut_selection(cx);
+                } else if ctrl && key == "v" {
+                    this.paste(cx);
+                } else if key == "f2" {
+                    this.begin_rename(cx);
+                } else if ctrl && shift && key == "n" {
+                    this.begin_mkdir(cx);
+                } else if key == "delete" && shift {
+                    this.request_permanent_delete(cx);
+                } else if key == "delete" {
+                    this.trash_selection(cx);
                 }
             }))
             .child(
@@ -681,8 +1227,18 @@ impl Render for Mirufm {
                     .flex_row()
                     .justify_between()
                     .child(div().text_color(rgb(0x999999)).child(breadcrumb))
-                    .when_some(self.notice.clone(), |d, n| {
-                        d.child(div().text_color(rgb(0xcc7777)).child(n))
+                    .child(match &self.pending_delete {
+                        Some(paths) => div()
+                            .text_color(rgb(0xff8888))
+                            .child(format!(
+                                "Delete {} item(s) permanently? Enter to confirm, Esc to cancel",
+                                paths.len()
+                            ))
+                            .into_any_element(),
+                        None => match self.notice.clone() {
+                            Some(n) => div().text_color(rgb(0xcc7777)).child(n).into_any_element(),
+                            None => div().into_any_element(),
+                        },
                     }),
             )
             .child(
