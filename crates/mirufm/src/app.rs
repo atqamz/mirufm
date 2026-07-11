@@ -88,9 +88,11 @@ struct Clipboard {
     paths: Vec<PathBuf>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum EditKind {
-    Rename { idx: usize },
+    // `path` is captured at begin_rename time so a reload cannot make the
+    // commit target a different file; `idx` is kept only to render the row.
+    Rename { idx: usize, path: PathBuf },
     Mkdir,
 }
 
@@ -193,6 +195,11 @@ impl Mirufm {
         shift: bool,
         cx: &mut Context<Self>,
     ) {
+        // A click away from an open inline edit dismisses it (cancel, not
+        // commit) before the click is handled, so it stops capturing keys.
+        if self.editing.is_some() {
+            self.cancel_edit(cx);
+        }
         self.active_col = col;
         if ctrl {
             self.state.toggle(col, i);
@@ -283,6 +290,22 @@ impl Mirufm {
         };
         let srcs = clip.paths.clone();
         let mode = clip.mode;
+        let was_cut = mode == ClipMode::Cut;
+
+        // A move empties the source directories too, so collect their distinct
+        // parents to reload alongside the destination; dest_dir is reloaded
+        // unconditionally below, so skip it here.
+        let mut source_parents: Vec<PathBuf> = Vec::new();
+        if was_cut {
+            for src in &srcs {
+                if let Some(parent) = src.parent() {
+                    let parent = parent.to_path_buf();
+                    if parent != dest_dir && !source_parents.contains(&parent) {
+                        source_parents.push(parent);
+                    }
+                }
+            }
+        }
 
         let (tx, rx) = mpsc::channel::<Option<String>>();
         let dest = dest_dir.clone();
@@ -300,23 +323,24 @@ impl Mirufm {
             let _ = tx.send(notice);
         });
 
-        // A cut clears the clipboard once consumed; a copy keeps it for repeat
-        // pastes.
-        if mode == ClipMode::Cut {
-            self.clipboard = None;
-        }
-
         cx.spawn(async move |this, cx| {
             let Ok(notice) = spawn_blocking(move || rx.recv()).await else {
                 return;
             };
             this.update(cx, |this, cx| {
-                if let Some(n) = notice {
-                    this.notice = Some(n);
+                // Clear the clipboard only when a cut fully succeeded, so a
+                // failed move leaves the source (and the clipboard) intact for a
+                // retry; a copy keeps the clipboard for repeat pastes.
+                if was_cut && notice.is_none() {
+                    this.clipboard = None;
                 }
-                // Reload the destination (and, for a move, the affected sources'
-                // parents) so the result shows immediately.
+                this.notice = notice;
+                // Reload the destination and, for a move, each source parent so
+                // both sides of the move show the result immediately.
                 this.load(dest_dir.clone(), cx);
+                for parent in &source_parents {
+                    this.load(parent.clone(), cx);
+                }
                 cx.notify();
             })
             .ok();
@@ -345,9 +369,7 @@ impl Mirufm {
                 return;
             };
             this.update(cx, |this, cx| {
-                if let Some(n) = notice {
-                    this.notice = Some(n);
-                }
+                this.notice = notice;
                 if let Some(dir) = dir {
                     this.load(dir, cx);
                 }
@@ -375,11 +397,18 @@ impl Mirufm {
         let Some(paths) = self.pending_delete.take() else {
             return;
         };
-        let dir = self
-            .state
-            .columns
-            .get(self.active_col)
-            .map(|c| c.path.clone());
+        // Reload the directories that actually lost files - the frozen paths'
+        // distinct parents - not the currently active column: the user may have
+        // navigated away between requesting and confirming the delete.
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for p in &paths {
+            if let Some(parent) = p.parent() {
+                let parent = parent.to_path_buf();
+                if !dirs.contains(&parent) {
+                    dirs.push(parent);
+                }
+            }
+        }
 
         let (tx, rx) = mpsc::channel::<Option<String>>();
         self.scheduler.spawn(Priority::Preview, move |_cancel| {
@@ -391,11 +420,9 @@ impl Mirufm {
                 return;
             };
             this.update(cx, |this, cx| {
-                if let Some(n) = notice {
-                    this.notice = Some(n);
-                }
-                if let Some(dir) = dir {
-                    this.load(dir, cx);
+                this.notice = notice;
+                for dir in &dirs {
+                    this.load(dir.clone(), cx);
                 }
                 cx.notify();
             })
@@ -418,7 +445,10 @@ impl Mirufm {
         };
         self.editing = Some(Edit {
             col,
-            kind: EditKind::Rename { idx },
+            kind: EditKind::Rename {
+                idx,
+                path: entry.path.clone(),
+            },
             buffer: entry.name.clone(),
         });
         cx.notify();
@@ -481,17 +511,9 @@ impl Mirufm {
         let Some(dir) = self.state.columns.get(edit.col).map(|c| c.path.clone()) else {
             return;
         };
-        // Resolve the rename target path now (it needs current state); the op
-        // itself runs on the scheduler so the render thread never blocks on IO.
-        let target = match edit.kind {
-            EditKind::Rename { idx } => self
-                .state
-                .columns
-                .get(edit.col)
-                .and_then(|c| c.entries.get(idx))
-                .map(|e| e.path.clone()),
-            EditKind::Mkdir => None,
-        };
+        // The rename path was captured at begin_rename time, so a reload between
+        // then and now cannot redirect the op at a different file. The op runs on
+        // the scheduler so the render thread never blocks on IO.
         let kind = edit.kind;
 
         let (tx, rx) = mpsc::channel::<Option<String>>();
@@ -499,10 +521,7 @@ impl Mirufm {
         self.scheduler.spawn(Priority::Preview, move |_cancel| {
             let result = match kind {
                 EditKind::Mkdir => mirufm_core::ops::mkdir(&op_dir, &name).map(|_| ()),
-                EditKind::Rename { .. } => match target {
-                    Some(path) => mirufm_core::ops::rename(&path, &name).map(|_| ()),
-                    None => Ok(()),
-                },
+                EditKind::Rename { path, .. } => mirufm_core::ops::rename(&path, &name).map(|_| ()),
             };
             let _ = tx.send(result.err().map(|e| format!("{e}")));
         });
@@ -511,9 +530,7 @@ impl Mirufm {
                 return;
             };
             this.update(cx, |this, cx| {
-                if let Some(n) = notice {
-                    this.notice = Some(n);
-                }
+                this.notice = notice;
                 // Reload the directory so the new / renamed entry appears.
                 this.load(dir.clone(), cx);
                 cx.notify();
@@ -1021,7 +1038,7 @@ impl Render for Mirufm {
                 let renaming = match &self.editing {
                     Some(Edit {
                         col: ec,
-                        kind: EditKind::Rename { idx },
+                        kind: EditKind::Rename { idx, .. },
                         buffer,
                     }) if *ec == col => Some((*idx, buffer.clone())),
                     _ => None,
@@ -1157,13 +1174,15 @@ impl Render for Mirufm {
                     return;
                 }
                 if this.pending_delete.is_some() {
+                    // The confirm strip is modal: Enter confirms, Escape
+                    // cancels, and every other key is swallowed so no
+                    // destructive or state-changing action fires underneath it.
                     if e.keystroke.key == "enter" {
                         this.confirm_delete(cx);
-                        return;
                     } else if e.keystroke.key == "escape" {
                         this.cancel_delete(cx);
-                        return;
                     }
+                    return;
                 }
                 let key = e.keystroke.key.as_str();
                 let ctrl = e.keystroke.modifiers.control;
