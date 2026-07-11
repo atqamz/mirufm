@@ -13,6 +13,8 @@ pub enum OpsError {
     },
     #[error("trash failed for {path}: {message}")]
     Trash { path: PathBuf, message: String },
+    #[error("cannot copy or move {src} into itself or its descendant {dest}")]
+    IntoSelf { src: PathBuf, dest: PathBuf },
 }
 
 fn valid_name(name: &str) -> bool {
@@ -134,8 +136,45 @@ fn copy_one(src: &Path, dest_dir: &Path) -> Result<PathBuf, OpsError> {
         .map(|n| n.to_string_lossy().into_owned())
         .ok_or_else(|| OpsError::InvalidName(src.display().to_string()))?;
     let dest = unique_dest(dest_dir, &name);
-    copy_recursive(src, &dest)?;
+    if is_into_self(src, &dest) {
+        return Err(OpsError::IntoSelf {
+            src: src.to_path_buf(),
+            dest,
+        });
+    }
+    if let Err(e) = copy_recursive(src, &dest) {
+        cleanup_dest(&dest);
+        return Err(e);
+    }
     Ok(dest)
+}
+
+/// True when `dest` is `src` itself or a path inside `src`. Copying or moving
+/// into such a destination would recurse forever (the fresh child gets
+/// enumerated by the source scan) or clobber the source. Canonicalizes both
+/// paths so a symlinked route is caught; `dest` usually does not exist yet, so
+/// its existing parent is canonicalized and the final component rejoined. Falls
+/// back to a lexical component-prefix check if canonicalization is impossible.
+fn is_into_self(src: &Path, dest: &Path) -> bool {
+    fn canonical(p: &Path) -> Option<PathBuf> {
+        if let Ok(c) = p.canonicalize() {
+            return Some(c);
+        }
+        let parent = p.parent()?;
+        let name = p.file_name()?;
+        Some(parent.canonicalize().ok()?.join(name))
+    }
+    match (canonical(src), canonical(dest)) {
+        (Some(s), Some(d)) => d.starts_with(&s),
+        _ => dest.starts_with(src),
+    }
+}
+
+/// Best-effort removal of a destination this operation just started creating,
+/// so a copy/move that fails partway leaves no orphan copy behind. The error is
+/// ignored: the caller is already returning the real failure.
+fn cleanup_dest(dest: &Path) {
+    let _ = remove_any(dest);
 }
 
 fn copy_recursive(src: &Path, dest: &Path) -> Result<(), OpsError> {
@@ -184,6 +223,12 @@ fn move_one(src: &Path, dest_dir: &Path) -> Result<PathBuf, OpsError> {
         .map(|n| n.to_string_lossy().into_owned())
         .ok_or_else(|| OpsError::InvalidName(src.display().to_string()))?;
     let dest = unique_dest(dest_dir, &name);
+    if is_into_self(src, &dest) {
+        return Err(OpsError::IntoSelf {
+            src: src.to_path_buf(),
+            dest,
+        });
+    }
     match std::fs::rename(src, &dest) {
         Ok(()) => Ok(dest),
         // EXDEV (18 on Linux): rename across filesystems is not allowed; fall
@@ -197,8 +242,17 @@ fn move_one(src: &Path, dest_dir: &Path) -> Result<PathBuf, OpsError> {
 }
 
 fn copy_then_delete(src: &Path, dest: &Path) -> Result<PathBuf, OpsError> {
-    copy_recursive(src, dest)?;
-    remove_any(src)?;
+    if let Err(e) = copy_recursive(src, dest) {
+        cleanup_dest(dest);
+        return Err(e);
+    }
+    if let Err(e) = remove_any(src) {
+        // The copy landed but the source could not be removed, so this move
+        // would duplicate the data. The dest was written by this op, so drop it
+        // and report the failure - no orphan copy is left behind.
+        cleanup_dest(dest);
+        return Err(e);
+    }
     Ok(dest.to_path_buf())
 }
 
@@ -426,5 +480,190 @@ mod tests {
         assert_eq!(got, dest);
         assert!(!tree.exists());
         assert_eq!(std::fs::read(dest.join("inner")).unwrap(), b"z");
+    }
+
+    #[test]
+    fn copy_into_self_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let foo = dir.path().join("foo");
+        std::fs::create_dir(&foo).unwrap();
+        std::fs::write(foo.join("data"), b"x").unwrap();
+
+        // Destination would be foo/foo, a descendant of the source.
+        let results = copy(&[foo.clone()], &foo);
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0].1, Err(OpsError::IntoSelf { .. })));
+        // No runaway recursion: no nested foo/foo was created.
+        assert!(!foo.join("foo").exists());
+    }
+
+    #[test]
+    fn copy_into_descendant_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let foo = dir.path().join("foo");
+        let bar = foo.join("bar");
+        std::fs::create_dir_all(&bar).unwrap();
+        std::fs::write(foo.join("data"), b"x").unwrap();
+
+        let results = copy(&[foo.clone()], &bar);
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0].1, Err(OpsError::IntoSelf { .. })));
+        assert!(!bar.join("foo").exists());
+    }
+
+    #[test]
+    fn move_into_descendant_is_rejected() {
+        // The same-fs rename would give EINVAL, but the guard must also cover
+        // the cross-device copy_then_delete fallback, so check it up front.
+        let dir = tempfile::tempdir().unwrap();
+        let foo = dir.path().join("foo");
+        let bar = foo.join("bar");
+        std::fs::create_dir_all(&bar).unwrap();
+
+        let results = move_items(&[foo.clone()], &bar);
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0].1, Err(OpsError::IntoSelf { .. })));
+        assert!(foo.exists());
+    }
+
+    #[test]
+    fn copy_recursive_failure_leaves_no_partial_dest() {
+        use std::os::unix::fs::symlink;
+
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let tree = src_dir.path().join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        std::fs::write(tree.join("good.txt"), b"ok").unwrap();
+        // A broken symlink makes std::fs::copy fail (it follows the link to a
+        // missing target), aborting the recursive copy partway. This is
+        // reproducible regardless of the running user.
+        symlink("nonexistent-target", tree.join("broken")).unwrap();
+
+        let results = copy(&[tree.clone()], dst_dir.path());
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.is_err());
+        // F9: the partially written dest subtree was cleaned up.
+        assert!(!dst_dir.path().join("tree").exists());
+    }
+
+    #[test]
+    fn copy_then_delete_cleans_orphan_when_source_remove_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let src_parent = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let tree = src_parent.path().join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        std::fs::write(tree.join("inner"), b"z").unwrap();
+        let dest = dst_dir.path().join("tree");
+
+        // Make the source's parent read-only so removing `tree` fails after the
+        // copy lands - the cross-device fallback's remove step errors.
+        let orig = std::fs::metadata(src_parent.path()).unwrap().permissions();
+        std::fs::set_permissions(src_parent.path(), std::fs::Permissions::from_mode(0o555))
+            .unwrap();
+        // Root ignores the read-only bit; skip rather than assert a false pass.
+        let enforced = std::fs::write(src_parent.path().join("probe"), b"").is_err();
+        let result = if enforced {
+            Some(copy_then_delete(&tree, &dest))
+        } else {
+            None
+        };
+        std::fs::set_permissions(src_parent.path(), orig).unwrap();
+
+        if let Some(result) = result {
+            assert!(result.is_err());
+            // F5: the orphan copy at dest was cleaned; the source is untouched.
+            assert!(!dest.exists());
+            assert!(tree.exists());
+        }
+    }
+
+    #[test]
+    fn copy_batch_reports_per_item_and_does_not_short_circuit() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let good = src_dir.path().join("good.txt");
+        std::fs::write(&good, b"x").unwrap();
+        let missing = src_dir.path().join("missing.txt");
+
+        // Invalid item first: a valid item after it must still be processed.
+        let results = copy(&[missing.clone(), good.clone()], dst_dir.path());
+        assert_eq!(results.len(), 2);
+        assert!(results[0].1.is_err());
+        assert!(results[1].1.is_ok());
+        assert!(dst_dir.path().join("good.txt").exists());
+    }
+
+    #[test]
+    fn move_batch_reports_per_item_and_does_not_short_circuit() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let good = src_dir.path().join("good.txt");
+        std::fs::write(&good, b"x").unwrap();
+        let missing = src_dir.path().join("missing.txt");
+
+        let results = move_items(&[missing.clone(), good.clone()], dst_dir.path());
+        assert_eq!(results.len(), 2);
+        assert!(results[0].1.is_err());
+        assert!(results[1].1.is_ok());
+        assert!(!good.exists());
+        assert!(dst_dir.path().join("good.txt").exists());
+    }
+
+    #[test]
+    fn delete_permanent_batch_does_not_short_circuit() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.txt");
+        std::fs::write(&good, b"x").unwrap();
+        let missing = dir.path().join("missing.txt");
+
+        let results = delete_permanent(&[missing.clone(), good.clone()]);
+        assert_eq!(results.len(), 2);
+        assert!(results[0].1.is_err());
+        assert!(results[1].1.is_ok());
+        assert!(!good.exists());
+    }
+
+    #[test]
+    fn trash_batch_does_not_short_circuit() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.txt");
+        std::fs::write(&good, b"x").unwrap();
+        let missing = dir.path().join("missing.txt");
+
+        let results = trash(&[missing.clone(), good.clone()]);
+        // Both items produce a result even though the first fails.
+        assert_eq!(results.len(), 2);
+        assert!(results[0].1.is_err());
+        assert_eq!(results[0].0, missing);
+        assert_eq!(results[1].0, good);
+        // Trash may be unavailable in a sandbox; accept ok or a Trash error, but
+        // a clean removal must leave nothing behind.
+        if results[1].1.is_ok() {
+            assert!(!good.exists());
+        } else {
+            assert!(matches!(results[1].1, Err(OpsError::Trash { .. })));
+        }
+    }
+
+    #[test]
+    fn move_non_exdev_rename_error_is_typed_not_copied() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let f = src_dir.path().join("a.txt");
+        std::fs::write(&f, b"x").unwrap();
+        // Point the "destination directory" at a regular file: rename fails with
+        // ENOTDIR (not EXDEV 18), so move_one returns a typed Io error via the
+        // direct-rename arm instead of taking the cross-device copy fallback.
+        let not_a_dir = dst_dir.path().join("file");
+        std::fs::write(&not_a_dir, b"").unwrap();
+
+        let results = move_items(&[f.clone()], &not_a_dir);
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0].1, Err(OpsError::Io { .. })));
+        // Source preserved: the rename failed and there was no copy fallback.
+        assert!(f.exists());
     }
 }

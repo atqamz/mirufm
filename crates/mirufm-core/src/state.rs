@@ -110,8 +110,31 @@ impl AppState {
             },
         );
         if let Some(c) = self.columns.iter_mut().find(|c| c.path == path) {
+            // Reconcile selection by path, not index: a reload can reorder or
+            // shrink the listing, so a stale index would silently address a
+            // different file and a following delete would hit the wrong entry.
+            // Surviving paths keep their selection at the new index; vanished
+            // paths drop out. The anchor is remapped or cleared the same way.
+            let selected_paths: Vec<PathBuf> = c
+                .selected
+                .iter()
+                .filter_map(|&i| c.entries.get(i).map(|e| e.path.clone()))
+                .collect();
+            let anchor_path = c
+                .anchor
+                .and_then(|i| c.entries.get(i).map(|e| e.path.clone()));
+
             c.entries = entries;
             c.stage = Stage::Loaded;
+
+            c.selected = c
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| selected_paths.contains(&e.path))
+                .map(|(i, _)| i)
+                .collect();
+            c.anchor = anchor_path.and_then(|p| c.entries.iter().position(|e| e.path == p));
         }
     }
 
@@ -272,5 +295,119 @@ mod tests {
             s.columns[0].selected.iter().copied().collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
+    }
+
+    #[test]
+    fn select_range_reversed_anchor() {
+        let mut s = AppState::new(PathBuf::from("/root"));
+        let entries: Vec<_> = (0..5)
+            .map(|i| file_entry(&format!("f{i}"), Path::new("/root")))
+            .collect();
+        s.set_loaded(Path::new("/root"), entries, SystemTime::UNIX_EPOCH);
+        s.select(0, 3); // anchor = 3
+        s.select_range(0, 1); // clicked index below the anchor
+        assert_eq!(
+            s.columns[0].selected.iter().copied().collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn select_range_without_anchor_selects_single() {
+        let mut s = AppState::new(PathBuf::from("/root"));
+        let entries: Vec<_> = (0..5)
+            .map(|i| file_entry(&format!("f{i}"), Path::new("/root")))
+            .collect();
+        s.set_loaded(Path::new("/root"), entries, SystemTime::UNIX_EPOCH);
+        // No prior selection: anchor is None, so the range collapses to i.
+        s.select_range(0, 2);
+        assert_eq!(
+            s.columns[0].selected.iter().copied().collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(s.columns[0].anchor, None);
+    }
+
+    #[test]
+    fn out_of_range_indices_are_noops() {
+        let mut s = AppState::new(PathBuf::from("/root"));
+        let entries = vec![
+            file_entry("a", Path::new("/root")),
+            file_entry("b", Path::new("/root")),
+        ];
+        s.set_loaded(Path::new("/root"), entries, SystemTime::UNIX_EPOCH);
+
+        // Out-of-range entry index: no panic, no selection change.
+        s.select(0, 99);
+        s.toggle(0, 99);
+        s.select_range(0, 99);
+        assert!(s.columns[0].selected.is_empty());
+
+        // Out-of-range column index: no panic, no state change.
+        s.select(5, 0);
+        s.toggle(5, 0);
+        s.select_range(5, 0);
+        assert!(s.columns[0].selected.is_empty());
+        assert_eq!(s.columns.len(), 1);
+    }
+
+    #[test]
+    fn set_loaded_reconciles_selection_by_path() {
+        let mut s = AppState::new(PathBuf::from("/root"));
+        let entries: Vec<_> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|&n| file_entry(n, Path::new("/root")))
+            .collect();
+        s.set_loaded(Path::new("/root"), entries, SystemTime::UNIX_EPOCH);
+
+        // Select b (idx 1) and d (idx 3), anchor on d.
+        s.select(0, 1);
+        s.toggle(0, 3);
+        assert_eq!(s.columns[0].anchor, Some(3));
+
+        // Reload: a and c vanish, order becomes [d, e, b].
+        let reloaded = vec![
+            file_entry("d", Path::new("/root")),
+            file_entry("e", Path::new("/root")),
+            file_entry("b", Path::new("/root")),
+        ];
+        s.set_loaded(Path::new("/root"), reloaded, SystemTime::UNIX_EPOCH);
+
+        // Selection follows by path: d -> idx 0, b -> idx 2.
+        assert_eq!(
+            s.columns[0].selected.iter().copied().collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        // Anchor d moved to idx 0.
+        assert_eq!(s.columns[0].anchor, Some(0));
+    }
+
+    #[test]
+    fn set_loaded_drops_vanished_selection() {
+        let mut s = AppState::new(PathBuf::from("/root"));
+        let entries = vec![
+            file_entry("a", Path::new("/root")),
+            file_entry("b", Path::new("/root")),
+            file_entry("c", Path::new("/root")),
+        ];
+        s.set_loaded(Path::new("/root"), entries, SystemTime::UNIX_EPOCH);
+        // Select a (idx 0) and c (idx 2), anchor on a.
+        s.select(0, 2);
+        s.toggle(0, 0);
+        assert_eq!(s.columns[0].anchor, Some(0));
+
+        // Reload without a: [b, c]. a vanishes, c survives at idx 1.
+        let reloaded = vec![
+            file_entry("b", Path::new("/root")),
+            file_entry("c", Path::new("/root")),
+        ];
+        s.set_loaded(Path::new("/root"), reloaded, SystemTime::UNIX_EPOCH);
+
+        assert_eq!(
+            s.columns[0].selected.iter().copied().collect::<Vec<_>>(),
+            vec![1]
+        );
+        // Anchor a vanished, so it is cleared.
+        assert_eq!(s.columns[0].anchor, None);
     }
 }
