@@ -122,6 +122,54 @@ fn remove_any(path: &Path) -> Result<(), OpsError> {
     })
 }
 
+pub fn copy(srcs: &[PathBuf], dest_dir: &Path) -> Vec<(PathBuf, Result<PathBuf, OpsError>)> {
+    srcs.iter()
+        .map(|src| (src.clone(), copy_one(src, dest_dir)))
+        .collect()
+}
+
+fn copy_one(src: &Path, dest_dir: &Path) -> Result<PathBuf, OpsError> {
+    let name = src
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| OpsError::InvalidName(src.display().to_string()))?;
+    let dest = unique_dest(dest_dir, &name);
+    copy_recursive(src, &dest)?;
+    Ok(dest)
+}
+
+fn copy_recursive(src: &Path, dest: &Path) -> Result<(), OpsError> {
+    let meta = std::fs::symlink_metadata(src).map_err(|source| OpsError::Io {
+        path: src.to_path_buf(),
+        source,
+    })?;
+    if meta.is_dir() {
+        std::fs::create_dir(dest).map_err(|source| OpsError::Io {
+            path: dest.to_path_buf(),
+            source,
+        })?;
+        let rd = std::fs::read_dir(src).map_err(|source| OpsError::Io {
+            path: src.to_path_buf(),
+            source,
+        })?;
+        for ent in rd {
+            let ent = ent.map_err(|source| OpsError::Io {
+                path: src.to_path_buf(),
+                source,
+            })?;
+            copy_recursive(&ent.path(), &dest.join(ent.file_name()))?;
+        }
+        Ok(())
+    } else {
+        // ponytail: a symlink here is copied as its target's content, not as a
+        // link. Acceptable for v1; revisit if link-preserving copy is needed.
+        std::fs::copy(src, dest).map(|_| ()).map_err(|source| OpsError::Io {
+            path: src.to_path_buf(),
+            source,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,5 +309,51 @@ mod tests {
         } else {
             assert!(matches!(results[0].1, Err(OpsError::Trash { .. })));
         }
+    }
+
+    #[test]
+    fn copy_file_into_dir() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let f = src_dir.path().join("a.txt");
+        std::fs::write(&f, b"hello").unwrap();
+
+        let results = copy(&[f.clone()], dst_dir.path());
+        let dest = results[0].1.as_ref().unwrap();
+        assert_eq!(dest, &dst_dir.path().join("a.txt"));
+        assert_eq!(std::fs::read(dest).unwrap(), b"hello");
+        assert!(f.exists()); // copy leaves the source
+    }
+
+    #[test]
+    fn copy_directory_recursively() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let tree = src_dir.path().join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        std::fs::write(tree.join("inner.txt"), b"deep").unwrap();
+
+        let results = copy(&[tree.clone()], dst_dir.path());
+        let dest = results[0].1.as_ref().unwrap();
+        assert_eq!(dest, &dst_dir.path().join("tree"));
+        assert_eq!(
+            std::fs::read(dest.join("inner.txt")).unwrap(),
+            b"deep"
+        );
+    }
+
+    #[test]
+    fn copy_auto_renames_on_collision() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let f = src_dir.path().join("a.txt");
+        std::fs::write(&f, b"new").unwrap();
+        std::fs::write(dst_dir.path().join("a.txt"), b"old").unwrap();
+
+        let results = copy(&[f.clone()], dst_dir.path());
+        let dest = results[0].1.as_ref().unwrap();
+        assert_eq!(dest, &dst_dir.path().join("a copy.txt"));
+        assert_eq!(std::fs::read(dst_dir.path().join("a.txt")).unwrap(), b"old");
+        assert_eq!(std::fs::read(dest).unwrap(), b"new");
     }
 }
