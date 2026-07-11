@@ -163,11 +163,43 @@ fn copy_recursive(src: &Path, dest: &Path) -> Result<(), OpsError> {
     } else {
         // ponytail: a symlink here is copied as its target's content, not as a
         // link. Acceptable for v1; revisit if link-preserving copy is needed.
-        std::fs::copy(src, dest).map(|_| ()).map_err(|source| OpsError::Io {
+        std::fs::copy(src, dest)
+            .map(|_| ())
+            .map_err(|source| OpsError::Io {
+                path: src.to_path_buf(),
+                source,
+            })
+    }
+}
+
+pub fn move_items(srcs: &[PathBuf], dest_dir: &Path) -> Vec<(PathBuf, Result<PathBuf, OpsError>)> {
+    srcs.iter()
+        .map(|src| (src.clone(), move_one(src, dest_dir)))
+        .collect()
+}
+
+fn move_one(src: &Path, dest_dir: &Path) -> Result<PathBuf, OpsError> {
+    let name = src
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| OpsError::InvalidName(src.display().to_string()))?;
+    let dest = unique_dest(dest_dir, &name);
+    match std::fs::rename(src, &dest) {
+        Ok(()) => Ok(dest),
+        // EXDEV (18 on Linux): rename across filesystems is not allowed; fall
+        // back to a recursive copy followed by deleting the source.
+        Err(e) if e.raw_os_error() == Some(18) => copy_then_delete(src, &dest),
+        Err(source) => Err(OpsError::Io {
             path: src.to_path_buf(),
             source,
-        })
+        }),
     }
+}
+
+fn copy_then_delete(src: &Path, dest: &Path) -> Result<PathBuf, OpsError> {
+    copy_recursive(src, dest)?;
+    remove_any(src)?;
+    Ok(dest.to_path_buf())
 }
 
 #[cfg(test)]
@@ -231,10 +263,7 @@ mod tests {
     fn mkdir_errors_when_exists() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("new")).unwrap();
-        assert!(matches!(
-            mkdir(dir.path(), "new"),
-            Err(OpsError::Exists(_))
-        ));
+        assert!(matches!(mkdir(dir.path(), "new"), Err(OpsError::Exists(_))));
     }
 
     #[test]
@@ -336,10 +365,7 @@ mod tests {
         let results = copy(&[tree.clone()], dst_dir.path());
         let dest = results[0].1.as_ref().unwrap();
         assert_eq!(dest, &dst_dir.path().join("tree"));
-        assert_eq!(
-            std::fs::read(dest.join("inner.txt")).unwrap(),
-            b"deep"
-        );
+        assert_eq!(std::fs::read(dest.join("inner.txt")).unwrap(), b"deep");
     }
 
     #[test]
@@ -355,5 +381,50 @@ mod tests {
         assert_eq!(dest, &dst_dir.path().join("a copy.txt"));
         assert_eq!(std::fs::read(dst_dir.path().join("a.txt")).unwrap(), b"old");
         assert_eq!(std::fs::read(dest).unwrap(), b"new");
+    }
+
+    #[test]
+    fn move_within_filesystem_uses_rename() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let f = src_dir.path().join("a.txt");
+        std::fs::write(&f, b"x").unwrap();
+
+        let results = move_items(&[f.clone()], dst_dir.path());
+        let dest = results[0].1.as_ref().unwrap();
+        assert_eq!(dest, &dst_dir.path().join("a.txt"));
+        assert!(!f.exists()); // move removes the source
+        assert!(dest.exists());
+    }
+
+    #[test]
+    fn move_auto_renames_on_collision() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let f = src_dir.path().join("a.txt");
+        std::fs::write(&f, b"new").unwrap();
+        std::fs::write(dst_dir.path().join("a.txt"), b"old").unwrap();
+
+        let results = move_items(&[f.clone()], dst_dir.path());
+        let dest = results[0].1.as_ref().unwrap();
+        assert_eq!(dest, &dst_dir.path().join("a copy.txt"));
+        assert!(!f.exists());
+    }
+
+    #[test]
+    fn copy_then_delete_moves_and_removes_source() {
+        // Exercises the cross-filesystem fallback path directly, without
+        // needing a real second mount.
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        let tree = src_dir.path().join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        std::fs::write(tree.join("inner"), b"z").unwrap();
+
+        let dest = dst_dir.path().join("tree");
+        let got = copy_then_delete(&tree, &dest).unwrap();
+        assert_eq!(got, dest);
+        assert!(!tree.exists());
+        assert_eq!(std::fs::read(dest.join("inner")).unwrap(), b"z");
     }
 }
