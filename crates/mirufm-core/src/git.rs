@@ -224,6 +224,24 @@ mod tests {
     }
 
     #[test]
+    fn staged_modification_of_tracked_file_is_modified() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init_repo(root);
+        std::fs::write(root.join("tracked.txt"), b"one").unwrap();
+        git(root, &["add", "tracked.txt"]);
+        git(root, &["commit", "-qm", "c"]);
+
+        // Edit then stage: this is a TreeIndex::Modification, not IndexWorktree.
+        std::fs::write(root.join("tracked.txt"), b"two").unwrap();
+        git(root, &["add", "tracked.txt"]);
+
+        let wd = discover(root).unwrap();
+        let map = status(&wd, &no_cancel()).unwrap();
+        assert_eq!(map.get(&wd.join("tracked.txt")), Some(&GitState::Modified));
+    }
+
+    #[test]
     fn rolls_up_nested_change_to_ancestor_dirs() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();

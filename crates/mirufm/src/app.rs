@@ -716,7 +716,6 @@ impl Mirufm {
             self.state
                 .set_loaded(&path, cached.entries, cached.loaded_at);
             self.watch_column(&path, cx);
-            self.load_git(path.clone(), cx);
             cx.notify();
         }
 
