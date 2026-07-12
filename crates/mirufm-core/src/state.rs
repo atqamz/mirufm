@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::fs::{Entry, EntryKind};
+use crate::git::GitState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stage {
@@ -18,6 +19,7 @@ pub struct Column {
     pub selected: BTreeSet<usize>,
     pub anchor: Option<usize>,
     pub stage: Stage,
+    pub repo_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -30,6 +32,7 @@ pub struct CachedFolder {
 pub struct AppState {
     pub columns: Vec<Column>,
     pub cache: HashMap<PathBuf, CachedFolder>,
+    pub git: HashMap<PathBuf, HashMap<PathBuf, GitState>>,
 }
 
 impl AppState {
@@ -41,8 +44,10 @@ impl AppState {
                 selected: BTreeSet::new(),
                 anchor: None,
                 stage: Stage::Loading,
+                repo_root: None,
             }],
             cache: HashMap::new(),
+            git: HashMap::new(),
         }
     }
 
@@ -97,6 +102,7 @@ impl AppState {
             selected: BTreeSet::new(),
             anchor: None,
             stage: Stage::Loading,
+            repo_root: None,
         });
         Some(entry.path)
     }
@@ -145,6 +151,23 @@ impl AppState {
             c.anchor = None;
             c.stage = Stage::Error(message);
         }
+    }
+
+    pub fn set_repo_root(&mut self, path: &Path, root: Option<PathBuf>) {
+        if let Some(c) = self.columns.iter_mut().find(|c| c.path == path) {
+            c.repo_root = root;
+        }
+    }
+
+    pub fn set_git(&mut self, repo_root: PathBuf, statuses: HashMap<PathBuf, GitState>) {
+        self.git.insert(repo_root, statuses);
+    }
+
+    pub fn git_state(&self, col: usize, entry_index: usize) -> Option<GitState> {
+        let c = self.columns.get(col)?;
+        let root = c.repo_root.as_ref()?;
+        let entry = c.entries.get(entry_index)?;
+        self.git.get(root)?.get(&entry.path).copied()
     }
 }
 
@@ -409,5 +432,34 @@ mod tests {
         );
         // Anchor a vanished, so it is cleared.
         assert_eq!(s.columns[0].anchor, None);
+    }
+
+    #[test]
+    fn git_state_looks_up_by_repo_and_path() {
+        use crate::git::GitState;
+        let mut s = AppState::new(PathBuf::from("/repo/src"));
+        let f = file_entry("main.rs", Path::new("/repo/src"));
+        s.set_loaded(Path::new("/repo/src"), vec![f], SystemTime::UNIX_EPOCH);
+        s.set_repo_root(Path::new("/repo/src"), Some(PathBuf::from("/repo")));
+
+        let mut statuses = HashMap::new();
+        statuses.insert(PathBuf::from("/repo/src/main.rs"), GitState::Modified);
+        s.set_git(PathBuf::from("/repo"), statuses);
+
+        assert_eq!(s.git_state(0, 0), Some(GitState::Modified));
+    }
+
+    #[test]
+    fn git_state_is_none_without_repo_root() {
+        use crate::git::GitState;
+        let mut s = AppState::new(PathBuf::from("/plain"));
+        let f = file_entry("x", Path::new("/plain"));
+        s.set_loaded(Path::new("/plain"), vec![f], SystemTime::UNIX_EPOCH);
+        // No repo_root set: even a populated git map must not match.
+        let mut statuses = HashMap::new();
+        statuses.insert(PathBuf::from("/plain/x"), GitState::Modified);
+        s.set_git(PathBuf::from("/plain"), statuses);
+
+        assert_eq!(s.git_state(0, 0), None);
     }
 }
