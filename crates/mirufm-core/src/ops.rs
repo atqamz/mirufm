@@ -372,7 +372,7 @@ mod tests {
     fn delete_permanent_reports_per_item_failure() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope");
-        let results = delete_permanent(&[missing.clone()]);
+        let results = delete_permanent(std::slice::from_ref(&missing));
         assert_eq!(results.len(), 1);
         assert!(results[0].1.is_err());
     }
@@ -382,7 +382,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("t.txt");
         std::fs::write(&f, b"x").unwrap();
-        let results = trash(&[f.clone()]);
+        let results = trash(std::slice::from_ref(&f));
         assert_eq!(results.len(), 1);
         // Trash may be unavailable in a sandboxed CI; accept either a clean
         // removal or a reported Trash error, but never a panic or a left-behind
@@ -401,7 +401,7 @@ mod tests {
         let f = src_dir.path().join("a.txt");
         std::fs::write(&f, b"hello").unwrap();
 
-        let results = copy(&[f.clone()], dst_dir.path());
+        let results = copy(std::slice::from_ref(&f), dst_dir.path());
         let dest = results[0].1.as_ref().unwrap();
         assert_eq!(dest, &dst_dir.path().join("a.txt"));
         assert_eq!(std::fs::read(dest).unwrap(), b"hello");
@@ -416,7 +416,7 @@ mod tests {
         std::fs::create_dir(&tree).unwrap();
         std::fs::write(tree.join("inner.txt"), b"deep").unwrap();
 
-        let results = copy(&[tree.clone()], dst_dir.path());
+        let results = copy(std::slice::from_ref(&tree), dst_dir.path());
         let dest = results[0].1.as_ref().unwrap();
         assert_eq!(dest, &dst_dir.path().join("tree"));
         assert_eq!(std::fs::read(dest.join("inner.txt")).unwrap(), b"deep");
@@ -430,7 +430,7 @@ mod tests {
         std::fs::write(&f, b"new").unwrap();
         std::fs::write(dst_dir.path().join("a.txt"), b"old").unwrap();
 
-        let results = copy(&[f.clone()], dst_dir.path());
+        let results = copy(std::slice::from_ref(&f), dst_dir.path());
         let dest = results[0].1.as_ref().unwrap();
         assert_eq!(dest, &dst_dir.path().join("a copy.txt"));
         assert_eq!(std::fs::read(dst_dir.path().join("a.txt")).unwrap(), b"old");
@@ -444,7 +444,7 @@ mod tests {
         let f = src_dir.path().join("a.txt");
         std::fs::write(&f, b"x").unwrap();
 
-        let results = move_items(&[f.clone()], dst_dir.path());
+        let results = move_items(std::slice::from_ref(&f), dst_dir.path());
         let dest = results[0].1.as_ref().unwrap();
         assert_eq!(dest, &dst_dir.path().join("a.txt"));
         assert!(!f.exists()); // move removes the source
@@ -459,7 +459,7 @@ mod tests {
         std::fs::write(&f, b"new").unwrap();
         std::fs::write(dst_dir.path().join("a.txt"), b"old").unwrap();
 
-        let results = move_items(&[f.clone()], dst_dir.path());
+        let results = move_items(std::slice::from_ref(&f), dst_dir.path());
         let dest = results[0].1.as_ref().unwrap();
         assert_eq!(dest, &dst_dir.path().join("a copy.txt"));
         assert!(!f.exists());
@@ -490,7 +490,7 @@ mod tests {
         std::fs::write(foo.join("data"), b"x").unwrap();
 
         // Destination would be foo/foo, a descendant of the source.
-        let results = copy(&[foo.clone()], &foo);
+        let results = copy(std::slice::from_ref(&foo), &foo);
         assert_eq!(results.len(), 1);
         assert!(matches!(results[0].1, Err(OpsError::IntoSelf { .. })));
         // No runaway recursion: no nested foo/foo was created.
@@ -505,7 +505,7 @@ mod tests {
         std::fs::create_dir_all(&bar).unwrap();
         std::fs::write(foo.join("data"), b"x").unwrap();
 
-        let results = copy(&[foo.clone()], &bar);
+        let results = copy(std::slice::from_ref(&foo), &bar);
         assert_eq!(results.len(), 1);
         assert!(matches!(results[0].1, Err(OpsError::IntoSelf { .. })));
         assert!(!bar.join("foo").exists());
@@ -520,7 +520,7 @@ mod tests {
         let bar = foo.join("bar");
         std::fs::create_dir_all(&bar).unwrap();
 
-        let results = move_items(&[foo.clone()], &bar);
+        let results = move_items(std::slice::from_ref(&foo), &bar);
         assert_eq!(results.len(), 1);
         assert!(matches!(results[0].1, Err(OpsError::IntoSelf { .. })));
         assert!(foo.exists());
@@ -540,7 +540,7 @@ mod tests {
         // reproducible regardless of the running user.
         symlink("nonexistent-target", tree.join("broken")).unwrap();
 
-        let results = copy(&[tree.clone()], dst_dir.path());
+        let results = copy(std::slice::from_ref(&tree), dst_dir.path());
         assert_eq!(results.len(), 1);
         assert!(results[0].1.is_err());
         // F9: the partially written dest subtree was cleaned up.
@@ -664,7 +664,7 @@ mod tests {
         let not_a_dir = work.path().join("file");
         std::fs::write(&not_a_dir, b"").unwrap();
 
-        let results = move_items(&[src.clone()], &not_a_dir);
+        let results = move_items(std::slice::from_ref(&src), &not_a_dir);
         assert_eq!(results.len(), 1);
         match &results[0].1 {
             Err(OpsError::Io { path, .. }) => assert_eq!(path, &src),
