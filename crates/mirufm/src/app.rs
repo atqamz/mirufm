@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -14,6 +15,7 @@ use gpui::{
     Window,
 };
 use mirufm_core::fs::{read_dir, Entry, EntryKind};
+use mirufm_core::git::{self, GitState};
 use mirufm_core::launch::DesktopApp;
 use mirufm_core::preview::{preview, MetaView, PreviewModel};
 use mirufm_core::scheduler::{Priority, Scheduler};
@@ -714,6 +716,7 @@ impl Mirufm {
             self.state
                 .set_loaded(&path, cached.entries, cached.loaded_at);
             self.watch_column(&path, cx);
+            self.load_git(path.clone(), cx);
             cx.notify();
         }
 
@@ -739,9 +742,44 @@ impl Mirufm {
                     Ok(entries) => {
                         this.state.set_loaded(&path, entries, SystemTime::now());
                         this.watch_column(&path, cx);
+                        this.load_git(path.clone(), cx);
                     }
                     Err(message) => this.state.set_error(&path, message),
                 }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Resolve the repo for `path`, record it on the column, and schedule a
+    /// whole-repo status refresh at the lowest priority so badges never delay a
+    /// directory read or the active preview. The result is posted back to the
+    /// foreground the same way `load` hands off its read.
+    fn load_git(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let root = git::discover(&path);
+        self.state.set_repo_root(&path, root.clone());
+        let Some(root) = root else {
+            return;
+        };
+
+        let (tx, rx) = mpsc::channel::<Option<HashMap<PathBuf, GitState>>>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let compute_root = root.clone();
+        self.scheduler.spawn(Priority::Preload, move |_cancel| {
+            let _ = tx.send(git::status(&compute_root, &cancel).ok());
+        });
+
+        cx.spawn(async move |this, cx| {
+            let Ok(result) = spawn_blocking(move || rx.recv()).await else {
+                return;
+            };
+            let Some(statuses) = result else {
+                return; // channel closed or status errored
+            };
+            this.update(cx, |this, cx| {
+                this.state.set_git(root, statuses);
                 cx.notify();
             })
             .ok();
@@ -971,6 +1009,18 @@ impl Mirufm {
     }
 }
 
+/// A fixed-width status glyph rendered ahead of an entry name. Blank (but still
+/// width-reserving, so names stay aligned) when the entry is clean.
+fn git_badge(state: Option<GitState>) -> impl IntoElement {
+    let (glyph, color) = match state {
+        Some(GitState::Modified) => ("M", rgb(0xd9a441)),
+        Some(GitState::Added) => ("A", rgb(0x5cb85c)),
+        Some(GitState::Untracked) => ("?", rgb(0x6cae7a)),
+        None => (" ", rgb(0x000000)),
+    };
+    div().w(px(12.)).flex_none().text_color(color).child(glyph)
+}
+
 fn render_meta(view: &MetaView) -> impl IntoElement {
     fn row(label: &str, value: String) -> impl IntoElement {
         div()
@@ -1091,9 +1141,13 @@ impl Render for Mirufm {
                                             }
                                         }
                                     };
+                                    let git = this.state.git_state(col, i);
                                     Some(
                                         div()
                                             .id(i)
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
                                             .px_2()
                                             .py_1()
                                             .cursor_pointer()
@@ -1137,7 +1191,8 @@ impl Render for Mirufm {
                                                     this.open_menu(col, i, event.position, cx);
                                                 }),
                                             )
-                                            .child(label),
+                                            .child(git_badge(git))
+                                            .child(div().child(label)),
                                     )
                                 })
                                 .collect::<Vec<_>>()
