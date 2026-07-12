@@ -1,23 +1,9 @@
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
-  "release-type": "rust",
+  "include-component-in-tag": false,
   "packages": {
-    "crates/mirufm": {
-      "component": "mirufm"
-    },
-    "crates/mirufm-core": {
-      "component": "mirufm-core"
+    ".": {
+      "release-type": "simple"
     }
-  },
-  "plugins": [
-    {
-      "type": "cargo-workspace",
-      "merge": false
-    },
-    {
-      "type": "linked-versions",
-      "groupName": "mirufm",
-      "components": ["mirufm", "mirufm-core"]
-    }
-  ]
+  }
 }
