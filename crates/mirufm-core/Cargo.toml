@@ -9,6 +9,7 @@ repository.workspace = true
 notify.workspace = true
 thiserror.workspace = true
 trash.workspace = true
+gix.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
