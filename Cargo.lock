@@ -4258,7 +4258,7 @@ dependencies = [
 
 [[package]]
 name = "mirufm"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "gpui",
  "gpui_platform",
@@ -4269,7 +4269,7 @@ dependencies = [
 
 [[package]]
 name = "mirufm-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "criterion",
  "gix",
